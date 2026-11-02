@@ -1,0 +1,26 @@
+std_msgs/Header header
+string source_snapshot_id
+uint64 source_accepted_frame_index
+uint64 map_revision
+time valid_until
+time prediction_valid_until
+string policy
+string source_geometry_policy
+string amplitude_policy
+bool forecast_visualization_only
+# Legacy hard_* field names now denote finite high-cost core margins, not obstacles.
+float64 hard_avoidance_radius_m
+float64 warning_radius_m
+float64 elevated_source_min_z_m
+float64 elevated_hard_projection_radius_m
+float64 elevated_warning_projection_radius_m
+nav_msgs/OccupancyGrid current_overlay
+float64[] forecast_horizons_s
+nav_msgs/OccupancyGrid[] forecast_overlays
+string[] active_source_ids
+string[] ordinary_projection_source_ids
+string[] elevated_projection_source_ids
+bool all_current_sources_within_map
+string[] out_of_bounds_current_source_ids
+bool all_forecast_sources_within_map
+string[] out_of_bounds_forecast_source_ids

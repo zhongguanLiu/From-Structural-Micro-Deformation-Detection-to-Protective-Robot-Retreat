@@ -1,0 +1,54 @@
+queue_size: 5
+shutdown_after: 0
+evaluate: false
+visualize: false
+verbose: false
+global_frame_name: camera_init
+sensor_frame_name: body
+num_threads: 4
+
+preprocessing:
+  min_range: &min_range 0.5
+  max_range: &max_range 20.0
+
+ever_free_integrator:
+  counter_to_reset: 150
+  temporal_buffer: 2
+  burn_in_period: 5
+  tsdf_occupancy_threshold: 0.3
+  neighbor_connectivity: 26
+
+clustering:
+  min_cluster_size: 20
+  max_cluster_size: 200000
+  min_extent: 0.0
+  max_extent: 200000.0
+  neighbor_connectivity: 6
+  grow_clusters_twice: false
+  min_cluster_separation: 0.2
+
+tracking:
+  min_track_duration: 0
+  max_tracking_distance: 1.0
+
+evaluation:
+  min_range: *min_range
+  max_range: *max_range
+  evaluate_point_level: false
+  evaluate_cluster_level: false
+  evaluate_object_level: false
+  save_clouds: false
+
+voxblox:
+  tsdf_voxel_size: 0.2
+  truncation_distance: 0.4
+  tsdf_voxels_per_side: 16
+  max_weight: 1000
+  method: projective
+  sensor_horizontal_resolution: 720
+  sensor_vertical_resolution: 120
+  sensor_vertical_field_of_view_degrees: 59.0
+  min_ray_length_m: *min_range
+  max_ray_length_m: *max_range
+  use_const_weight: true
+  verbose: false

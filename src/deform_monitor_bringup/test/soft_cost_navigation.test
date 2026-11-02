@@ -1,0 +1,21 @@
+<launch>
+  <!-- Isolated synthetic-map test: no Gazebo, robot goals, or velocity actuation. -->
+  <node pkg="tf" type="static_transform_publisher" name="test_robot_tf"
+        args="1.05 5.05 0 0 0 0 camera_init navigation_base 50" />
+  <node pkg="tf" type="static_transform_publisher" name="test_sensor_tf"
+        args="1.05 5.05 0 0 0 0 camera_init body 50" />
+  <node pkg="deform_monitor_bringup" type="mission_map_proxy.py" name="test_map_proxy">
+    <param name="base_topic" value="/test/base" />
+    <param name="normalized_base_topic" value="/test/base_normalized" />
+    <param name="overlay_topic" value="/test/overlay" />
+  </node>
+  <node pkg="move_base" type="move_base" name="move_base">
+    <rosparam command="load" file="$(find deform_monitor_bringup)/config/icra2027_move_base.yaml" />
+    <rosparam command="load" file="$(find deform_monitor_bringup)/config/icra2027_global_costmap.yaml" />
+    <rosparam command="load" file="$(find deform_monitor_bringup)/config/icra2027_local_costmap.yaml" />
+    <param name="global_costmap/always_send_full_costmap" value="true" />
+    <param name="local_costmap/always_send_full_costmap" value="true" />
+  </node>
+  <test pkg="deform_monitor_bringup" type="test_soft_cost_navigation.py"
+        test-name="soft_cost_navigation" time-limit="70" />
+</launch>

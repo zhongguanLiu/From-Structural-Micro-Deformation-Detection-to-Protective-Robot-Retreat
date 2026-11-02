@@ -1,0 +1,4 @@
+std_msgs/Header header
+deform_monitor_v3/V1StableId128 registration_token
+deform_monitor_v3/V1StableId128 invalidated_snapshot_id
+uint16[] reason_codes

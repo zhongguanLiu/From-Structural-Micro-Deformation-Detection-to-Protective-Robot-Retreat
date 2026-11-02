@@ -1,0 +1,25 @@
+<launch>
+  <arg name="config" default="$(find deform_avoidance_map)/config/avoidance.yaml" />
+  <!-- Empty keeps the selected YAML value; a numeric launch argument is an
+       explicit startup-time override. -->
+  <arg name="hard_avoidance_radius_m" default="" />
+  <arg name="warning_radius_m" default="" />
+  <arg name="elevated_hard_projection_radius_m" default="" />
+  <arg name="elevated_warning_projection_radius_m" default="" />
+  <node pkg="deform_avoidance_map" type="deformation_avoidance_node.py"
+        name="deformation_avoidance" output="screen" required="true">
+    <rosparam command="load" file="$(arg config)" />
+    <param if="$(eval arg('hard_avoidance_radius_m') != '')"
+           name="deform_avoidance/hard_avoidance_radius_m"
+           value="$(arg hard_avoidance_radius_m)" />
+    <param if="$(eval arg('warning_radius_m') != '')"
+           name="deform_avoidance/warning_radius_m"
+           value="$(arg warning_radius_m)" />
+    <param if="$(eval arg('elevated_hard_projection_radius_m') != '')"
+           name="deform_avoidance/elevated_hard_projection_radius_m"
+           value="$(arg elevated_hard_projection_radius_m)" />
+    <param if="$(eval arg('elevated_warning_projection_radius_m') != '')"
+           name="deform_avoidance/elevated_warning_projection_radius_m"
+           value="$(arg elevated_warning_projection_radius_m)" />
+  </node>
+</launch>

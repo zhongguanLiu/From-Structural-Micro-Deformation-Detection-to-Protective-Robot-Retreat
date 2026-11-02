@@ -1,0 +1,6 @@
+deform_monitor_v3/V1StableId128 snapshot_token
+string robot_geometry_revision
+float64 body_sweep_tolerance_m
+deform_monitor_v3/V1TimedRobotPose[] motion
+---
+deform_monitor_v3/V1RiskAssessment assessment

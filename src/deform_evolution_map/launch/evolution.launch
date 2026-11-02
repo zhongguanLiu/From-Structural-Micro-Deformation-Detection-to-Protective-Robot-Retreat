@@ -1,0 +1,7 @@
+<launch>
+  <arg name="config" default="$(find deform_evolution_map)/config/evolution.yaml" />
+  <node pkg="deform_evolution_map" type="deformation_evolution_node.py"
+        name="deformation_evolution" output="screen" required="true">
+    <rosparam command="load" file="$(arg config)" />
+  </node>
+</launch>

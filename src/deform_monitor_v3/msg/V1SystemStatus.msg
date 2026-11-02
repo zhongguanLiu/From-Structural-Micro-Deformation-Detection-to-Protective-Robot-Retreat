@@ -1,0 +1,16 @@
+deform_monitor_v3/V1Common common
+uint8 phase
+deform_monitor_v3/V1StableId128 reference_snapshot_id
+bool reference_frozen
+uint32 gdu_count
+uint32 interface_count
+uint32 occupancy_cell_count
+uint32 hazard_count
+string[] active_gates
+uint64 deadline_failure_count
+uint64 resource_failure_count
+string reason_catalog_version
+time last_attempt_stamp
+uint64 last_attempt_frame_index
+bool last_attempt_published
+uint16[] last_attempt_reason_codes

@@ -1,0 +1,168 @@
+<launch>
+  <!-- Avoid the legacy online model database timeout; all assets are local. -->
+  <env name="GAZEBO_MODEL_DATABASE_URI" value=""/>
+
+  <arg name="world" default="$(find livox_laser_simulation)/worlds/ICRA2027.world"/>
+  <arg name="scene_record_directory" default=""/>
+  <arg name="motion_config" default="$(find livox_laser_simulation)/config/icra2027_motion.yaml"/>
+  <arg name="gui" default="true"/>
+  <arg name="paused" default="false"/>
+  <arg name="rviz" default="true"/>
+  <!-- Standalone RViz may request the raw bridge.  Closed-loop bringup sets
+       its nested simulation RViz false and therefore avoids this unused copy. -->
+  <arg name="publish_raw_rviz_cloud" default="$(arg rviz)"/>
+
+  <arg name="linear_speed_mm_s" default="1.0"/>
+  <arg name="angular_speed_rad_s" default="0.0015"/>
+  <arg name="start_delay" default="3.0"/>
+  <arg name="duration" default="15.0"/>
+  <arg name="end_hold" default="10.0"/>
+  <arg name="truth_rate" default="10.0"/>
+
+  <arg name="spawn_robot" default="true"/>
+  <arg name="enable_lidar" default="true"/>
+  <arg name="enable_rear_lidar" default="false"/>
+  <arg name="enable_imu" default="true"/>
+  <arg name="enable_planar_move" default="true"/>
+  <!-- One Gazebo ray update uses one simulation pose for all 20,000 rays. -->
+  <arg name="lidar_point_time_mode" default="snapshot"/>
+  <!-- Gazebo is scheduled at 10 Hz but the CPU ray workload delivers about
+       5 Hz on the calibrated host; measurement recursion uses real stamps. -->
+  <arg name="lidar_update_rate_hz" default="10.0"/>
+  <!-- The formal scene needs no returns outside this physical interval. -->
+  <arg name="lidar_min_range_m" default="0.5"/>
+  <arg name="lidar_max_range_m" default="20.0"/>
+  <!-- Preserve every primary ray for SLAM/deformation sensitivity.  The
+       overlapping auxiliary tail scan uses a deterministic stride of two. -->
+  <arg name="primary_lidar_downsample" default="1"/>
+  <arg name="secondary_lidar_downsample" default="2"/>
+  <!-- Gazebo ray rendering is unnecessary for experiments; RViz cloud stays enabled. -->
+  <arg name="visualize_lidar_rays" default="false"/>
+  <arg name="auto_drive" default="false"/>
+  <!-- Fixed research start; decorative wooden cases are not pose references. -->
+  <arg name="robot_x" default="2.45606"/>
+  <arg name="robot_y" default="-9.66345"/>
+  <!-- anquanshengchan saved z 2.163280 + local floor -0.657382 -->
+  <arg name="robot_z" default="1.505898"/>
+  <arg name="robot_yaw" default="1.57079632679"/>
+
+  <arg name="record_truth" default="true"/>
+  <arg name="truth_output_directory" default="$(eval optenv('DEFORM_MONITOR_OUTPUT_ROOT', find('deform_monitor_bringup') + '/../../experiment_output') + '/icra2027')"/>
+
+  <rosparam command="load" file="$(arg motion_config)" ns="icra2027_motion"/>
+  <param name="icra2027_motion/linear_speed_mm_s" value="$(arg linear_speed_mm_s)"/>
+  <param name="icra2027_motion/angular_speed_rad_s" value="$(arg angular_speed_rad_s)"/>
+  <param name="icra2027_motion/start_delay" value="$(arg start_delay)"/>
+  <param name="icra2027_motion/duration" value="$(arg duration)"/>
+  <param name="icra2027_motion/end_hold" value="$(arg end_hold)"/>
+  <param name="icra2027_motion/truth_rate_hz" value="$(arg truth_rate)"/>
+
+  <include file="$(find livox_laser_simulation)/launch/mid360_fastlio.launch">
+    <arg name="world" value="$(arg world)"/>
+    <arg name="scene_world" value="$(arg world)"/>
+    <arg name="scene_record_directory" value="$(arg scene_record_directory)"/>
+    <arg name="scene_motion_config" value="$(arg motion_config)"/>
+    <arg name="model" value="$(find a2_description)/urdf/a2_mid360.urdf.xacro"/>
+    <arg name="robot_name" value="a2_mid360"/>
+    <arg name="gui" value="$(arg gui)"/>
+    <!-- Start from a paused simulation-clock origin.  The primary event
+         drives both real ray tables with one measurement stamp (never
+         overwritten).  When the caller did not explicitly request a paused
+         world, unpause only after both tables and merger transports are ready. -->
+    <arg name="paused"
+         value="$(eval arg('paused') or arg('enable_rear_lidar'))"/>
+    <arg name="lockstep" value="$(arg enable_rear_lidar)"/>
+    <arg name="rviz" value="$(arg rviz)"/>
+    <arg name="rviz_config" value="$(find livox_laser_simulation)/rviz/icra2027_a2_mid360.rviz"/>
+    <arg name="publish_rviz_cloud" value="$(arg publish_raw_rviz_cloud)"/>
+    <arg name="publish_joint_states" value="true"/>
+    <arg name="publish_world_to_odom" value="true"/>
+    <arg name="spawn_robot" value="$(arg spawn_robot)"/>
+    <arg name="enable_lidar" value="$(arg enable_lidar)"/>
+    <arg name="enable_rear_lidar" value="$(arg enable_rear_lidar)"/>
+    <arg name="enable_imu" value="$(arg enable_imu)"/>
+    <arg name="enable_planar_move" value="$(arg enable_planar_move)"/>
+    <arg name="visualize_lidar_rays" value="$(arg visualize_lidar_rays)"/>
+    <arg name="lidar_update_rate_hz" value="$(arg lidar_update_rate_hz)"/>
+    <arg name="lidar_min_range_m" value="$(arg lidar_min_range_m)"/>
+    <arg name="lidar_max_range_m" value="$(arg lidar_max_range_m)"/>
+    <arg name="lidar_point_time_mode" value="$(arg lidar_point_time_mode)"/>
+    <arg name="primary_lidar_downsample"
+         value="$(arg primary_lidar_downsample)"/>
+    <arg name="secondary_lidar_downsample"
+         value="$(arg secondary_lidar_downsample)"/>
+    <arg name="auto_drive" value="$(arg auto_drive)"/>
+    <arg name="x" value="$(arg robot_x)"/>
+    <arg name="y" value="$(arg robot_y)"/>
+    <arg name="z" value="$(arg robot_z)"/>
+    <arg name="yaw" value="$(arg robot_yaw)"/>
+  </include>
+
+  <node if="$(eval arg('enable_rear_lidar') and not arg('paused'))"
+        pkg="livox_laser_simulation"
+        type="unpause_synchronized_dual_lidar.py"
+        name="unpause_synchronized_dual_lidar" output="screen" required="true">
+    <param name="primary_ready_topic" value="/livox/front/lidar/ready"/>
+    <param name="secondary_ready_topic" value="/livox/rear/lidar/ready"/>
+    <param name="merge_ready_topic" value="/livox/merge/ready"/>
+    <param name="wall_timeout_s" value="30.0"/>
+  </node>
+
+  <!-- Both rigid sensors are expressed in livox_frame before FAST-LIO.  One
+       primary event ray-casts and publishes both snapshots at the identical
+       real Gazebo epoch; the front IMU is the only IMU used by FAST-LIO. -->
+  <node pkg="livox_laser_simulation" type="dual_livox_merge_node"
+        name="dual_livox_merge" output="screen" required="true">
+    <param name="primary_topic" value="/livox/front/lidar"/>
+    <param name="secondary_topic" value="/livox/rear/lidar"/>
+    <param name="output_topic" value="/livox/lidar"/>
+    <param name="diagnostics_topic" value="/livox/merge/diagnostics"/>
+    <param name="readiness_topic" value="/livox/merge/ready"/>
+    <!-- Read-only cumulative telemetry.  A saved-world scheduler catch-up
+         callback suppressed before ray generation is not a received scan,
+         queue drop, or pairing failure. -->
+    <param name="primary_scheduler_catch_up_topic"
+           value="/livox/front/lidar/scheduler_catch_up_suppressed_count"/>
+    <param name="point_time_mode" value="$(arg lidar_point_time_mode)"/>
+    <param name="configured_sensor_update_rate_hz"
+           value="$(arg lidar_update_rate_hz)"/>
+    <!-- The values are passed to the physical ray elements above and copied
+         here only as read-only provenance.  Rays end at max range and valid
+         returns obey min < r < max.  The merger never range-crops; only its
+         formal dual output removes exact (0,0,0) no-return sentinels. -->
+    <param name="configured_min_range_m" value="$(arg lidar_min_range_m)"/>
+    <param name="configured_max_range_m" value="$(arg lidar_max_range_m)"/>
+    <param name="configured_ray_samples_per_sensor" value="20000"/>
+    <!-- These private ROS parameters mirror the exact xacro/plugin strides,
+         so every recorded run can audit configuration against point counts. -->
+    <param name="primary_downsample" value="$(arg primary_lidar_downsample)"/>
+    <param name="secondary_downsample" value="$(arg secondary_lidar_downsample)"/>
+    <!-- Actual scene overlap is audited on every tenth accepted pair.  The
+         two already-downsampled return sets are voxelized in livox_frame;
+         this diagnostic path does not alter the merged FAST-LIO message. -->
+    <param name="overlap_voxel_size_m" value="0.20"/>
+    <param name="overlap_evaluation_pair_stride" value="10"/>
+    <param name="primary_frame" value="livox_frame"/>
+    <param name="secondary_frame" value="livox_rear_frame"/>
+    <param name="secondary_enabled" value="$(arg enable_rear_lidar)"/>
+    <!-- The primary plugin drives both real ray tables at one shared Gazebo
+         acquisition epoch, so the expected inter-sensor delta is exactly 0.
+         The 25 ms check remains a fail-closed guard against malformed or
+         unexpectedly asynchronous inputs; stamps are never rewritten. -->
+    <param name="maximum_sync_delta_s" value="0.025"/>
+    <param name="calibration_revision"
+           value="a2-mid360-frontlevel-tail-rearup25deg-v3"/>
+    <rosparam param="translation_primary_secondary_m">[-0.6181, 0.0, 0.0]</rosparam>
+    <rosparam param="rotation_primary_secondary_row_major">
+      [-0.9063077870366499, 0.0, 0.4226182617406994,
+       0.0, -1.0, 0.0,
+       0.4226182617406994, 0.0, 0.9063077870366499]
+    </rosparam>
+  </node>
+
+  <node if="$(arg record_truth)" pkg="livox_laser_simulation"
+        type="icra2027_truth_recorder.py" name="icra2027_truth_recorder" output="screen">
+    <param name="truth_topic" value="/icra2027_motion/truth"/>
+    <param name="output_directory" value="$(arg truth_output_directory)"/>
+  </node>
+</launch>

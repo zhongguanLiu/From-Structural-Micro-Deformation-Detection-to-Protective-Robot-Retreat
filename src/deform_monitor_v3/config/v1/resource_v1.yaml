@@ -1,0 +1,74 @@
+v1:
+  resource:
+    session_id: deform-monitor-research-session-v1
+    world_frame: camera_init
+    grid_origin_m: [0.0, 0.0, 0.0]
+    frame_sync_tolerance_s: 0.005
+    upstream_registered_cloud_deskew_verified: false
+    raw_frame_buffer_s: 120.0
+    max_points_per_frame: 200000
+    max_raw_buffer_points: 2000000
+    reference_min_frames: 6
+    reference_min_surfel_exposures: 6
+    reference_min_duration_s: 0.5
+    bounded_reference_search: false
+    max_update_gap_s: 15.0          
+    fixed_lag_frames: 3
+    mixture_max_components: 24
+    other_mass_alarm: 0.25
+    surfel_seed_spacing_m: 0.10
+    graph_neighbor_radius_m: 0.25
+    graph_max_neighbors: 36
+    control_spacing_m: 0.20
+    pou_support_radius_m: 0.30
+    interface_scales_m: [0.20, 0.40]
+    occupancy_voxel_m: 0.10
+    prediction_horizons_s: [0.0, 0.5, 1.0, 2.0]
+    prediction_samples: 256
+    deadline_ms: 15000.0            
+    max_gdu: 64
+    min_controls_per_gdu: 6
+    max_controls_per_gdu: 16
+    max_interfaces_per_gdu: 1
+    max_interfaces: 64
+    max_events: 16384               
+    max_tiles: 1048576              
+    max_stable_ids: 2000000       
+    max_evidence_links: 2000000
+    map_ttl_s: 15.0                
+    query_ttl_s: 0.5
+    association_max_candidates: 3
+    min_patches_per_gdu: 3
+    max_patches_per_gdu: 100
+    pose_control_min_patches: 20
+    pose_control_exclusion_radius_m: 5.0
+    upstream_stationary_pose_freeze_verified: false
+    source_missing_consecutive_limit: 3
+    ctmc_max_substep_s: 0.05
+    extrinsic:
+      revision: fastlio-mid360-fixed-v1
+      digest: 778c49a55f6b521517b15e28cde43d117e2c73f81b26f33941973191a8486412
+      online_estimation_enabled: false
+      rotation_row_major: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      translation_m: [0.038, 0.0, 0.01]
+      covariance_row_major: [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  numerical:
+    probability_floor: 1.0e-12
+    pou_denominator_min: 1.0e-12
+    psd_eigenvalue_tolerance: 1.0e-10
+    cholesky_jitter_initial: 1.0e-12
+    cholesky_jitter_multiplier: 10.0
+    cholesky_jitter_attempts: 6
+    solve_residual_tolerance: 1.0e-8
+    normalization_tolerance: 1.0e-10
+    tie_tolerance: 1.0e-12
+  software_revision: deform-monitor-v1-source
+  io:
+    cloud_topic: /cloud_registered
+    covariance_topic: /lio_odom_cov

@@ -1,0 +1,117 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Name: Ground Grid
+      Plane: XY
+      Plane Cell Count: 30
+      Reference Frame: <Fixed Frame>
+    - Alpha: 1
+      Class: rviz/RobotModel
+      Collision Enabled: false
+      Enabled: true
+      Name: A2 + Mid360
+      Robot Description: robot_description
+      Visual Enabled: true
+    - Class: rviz/TF
+      Enabled: true
+      Frame Timeout: 15
+      Marker Scale: 0.18
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 255
+        Min Value: 0
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color Transformer: Intensity
+      Decay Time: 0.5
+      Enabled: true
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: Mid360 PointCloud
+      Position Transformer: XYZ
+      Queue Size: 5
+      Selectable: true
+      Size (Pixels): 2
+      Style: Points
+      Topic: /livox/pointcloud2
+      Unreliable: false
+      Use Fixed Frame: true
+    - Angle Tolerance: 0.1
+      Class: rviz/Odometry
+      Enabled: true
+      Keep: 100
+      Name: A2 Ground Truth Odometry
+      Position Tolerance: 0.05
+      Topic: /ground_truth/odom
+      Shape:
+        Alpha: 1
+        Axes Length: 0.3
+        Axes Radius: 0.03
+        Color: 255; 25; 0
+        Head Length: 0.07
+        Head Radius: 0.035
+        Shaft Length: 0.2
+        Shaft Radius: 0.02
+        Value: Arrow
+    - Alpha: 0.7
+      Class: rviz/Map
+      Color Scheme: map
+      Enabled: false
+      Name: SLAM Map (future)
+      Topic: /map
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: false
+      Name: Global Plan (future)
+      Pose Style: None
+      Topic: /move_base/NavfnROS/plan
+  Enabled: true
+  Global Options:
+    Background Color: 35; 35; 35
+    Default Light: true
+    Fixed Frame: odom
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+    - Class: rviz/SetInitialPose
+      Topic: /initialpose
+    - Class: rviz/SetGoal
+      Topic: /move_base_simple/goal
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 5
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0.5
+      Pitch: 0.45
+      Target Frame: base_link
+      Yaw: 0.8
+Window Geometry:
+  Height: 900
+  Width: 1500

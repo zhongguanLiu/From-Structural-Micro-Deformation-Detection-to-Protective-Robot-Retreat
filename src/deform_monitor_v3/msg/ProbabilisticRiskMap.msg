@@ -1,0 +1,12 @@
+std_msgs/Header header
+uint32 schema_version
+uint64 frame_index
+uint32 reference_epoch
+float32 voxel_size
+geometry_msgs/Point grid_origin
+string model_version
+string calibration_version
+bool probabilities_calibrated
+bool approximate_joint_model
+uint64 dropped_frame_count
+deform_monitor_v3/ProbabilisticRiskVoxel[] voxels

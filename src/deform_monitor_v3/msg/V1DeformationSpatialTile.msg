@@ -1,0 +1,9 @@
+deform_monitor_v3/V1Common common
+string tile_key
+uint32 lod
+deform_monitor_v3/V1StableId128 source_snapshot_id
+deform_monitor_v3/V1ReferenceSupportSample[] reference_support
+deform_monitor_v3/V1DeformationSample[] physical_deformation
+deform_monitor_v3/V1InterfacePosterior[] interface_motion
+deform_monitor_v3/V1SpatialDetectionEvidence[] detection_evidence
+deform_monitor_v3/V1HazardGeometry[] spatial_influence

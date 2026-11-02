@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.0.2)
+project(m3c2_baseline)
+add_compile_options(-std=c++14 -Wall -Wextra)
+find_package(catkin REQUIRED COMPONENTS roscpp sensor_msgs std_msgs pcl_ros pcl_conversions)
+find_package(PCL REQUIRED COMPONENTS common filters kdtree search segmentation)
+find_package(Boost REQUIRED COMPONENTS filesystem system)
+find_package(ZLIB REQUIRED)
+catkin_package(INCLUDE_DIRS include LIBRARIES m3c2_core)
+include_directories(include ${catkin_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS})
+add_library(m3c2_core src/m3c2/m3c2_baseline.cpp src/core/cluster_extractor.cpp
+  src/core/reference_manager.cpp src/core/temporal_window_fusion.cpp)
+target_link_libraries(m3c2_core ${PCL_LIBRARIES})
+add_executable(m3c2_node src/m3c2_node.cpp)
+target_link_libraries(m3c2_node m3c2_core ${catkin_LIBRARIES} ${Boost_LIBRARIES} ${ZLIB_LIBRARIES})
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(test_m3c2_baseline test/test_m3c2_baseline.cpp)
+  if(TARGET test_m3c2_baseline)
+    target_link_libraries(test_m3c2_baseline m3c2_core gtest_main)
+  endif()
+endif()
+install(TARGETS m3c2_core m3c2_node
+  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+install(DIRECTORY launch config DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})

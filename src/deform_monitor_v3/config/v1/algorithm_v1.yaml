@@ -1,0 +1,40 @@
+v1:
+  algorithm:
+    schema_id: deform-monitor-v1
+    schema_version: 3
+    input_profile: FRAME_XYZI_REGISTERED
+    cloud_coordinate_contract: WORLD_REGISTERED_HEADER_MUST_MATCH
+    pose_covariance_source_contract: FASTLIO23_POS_WORLD_ROT_IMU_LOCAL_RIGHT
+    pose_covariance_contract: LIDAR_WORLD_LEFT_ROTATION_WORLD_ADDITIVE_ORIGIN
+    pose_covariance_order: ROTATION_THEN_SENSOR_ORIGIN
+    fastlio_state_dim: 23
+    fastlio_state_order: pos,rot,offset_R_L_I,offset_T_L_I,vel,bg,ba,grav
+    pose_covariance_invalid_action: REJECT_FRAME_NO_FALLBACK
+    sensor_extrinsic_mode: FIXED_DIGESTED_ONLINE_ESTIMATION_REJECTED
+    pose_temporal_model: SPATIALLY_EXCLUDED_CONTROL_ONLY_SE3_PLUS_FIXED_LAG_OU
+    semantic_scene_inference: DISABLED
+    object_identity_input: DISABLED
+    intensity_likelihood_usage: DISABLED
+    reference_policy: SAME_SESSION_LATEST_PRETRIGGER_ELIGIBLE_ELSE_DWELL_FROZEN
+    reference_update_during_monitoring: false
+    reference_uncertainty_representation: EXPOSURE_SCATTER_PLUS_NONSHRINKING_EPOCH_STATIC_STATE
+    geometry_carrier: NONSEMANTIC_SURFEL_GRAPH
+    reference_connectivity: LINK_CORE_WITH_AMBIGUOUS_STATIC_MIXTURE
+    field_basis: GRAPH_POU_WENDLAND_C2_MINIMAL_OBSERVABLE_COORDINATES
+    observable_geometry_hypotheses: [SURFACE_LIKE, CURVE_LIKE, ISOTROPIC, OTHER]
+    support_partition_roles: [POSE_CONTROL, ASSOCIATION, MEASUREMENT, OCCUPANCY]
+    support_partition_percent: [20, 20, 40, 20]
+    structural_states: [U, A, C]
+    state_time_model: CTMC_UAC_FIXED_SPARSITY
+    ctmc_continuous_coupling: EQUAL_SUBSTEP_PARENT_PROPAGATE_THEN_ENDPOINT_RESET
+    field_mode_set: [SURFACE_NORMAL_1D, CURVE_NORMAL_PLANE_2D, MULTIVIEW_FULL_3D, OTHER_UNMONITORED]
+    update_granularity: ONE_ACCEPTED_FRAME
+    active_dynamics: CONSTANT_VELOCITY_WHITE_ACCELERATION
+    changed_dynamics: PERSISTENT_OFFSET_RANDOM_WALK
+    robust_likelihood: GAUSSIAN_STUDENT_T_CONTAMINATION_MIXTURE
+    student_scale_quadrature_order: 8
+    selection_model: SPLIT_SUPPORT_WITH_EXPLICIT_SELECTION
+    association_factor: CALIBRATED_MULTINOMIAL_LOGIT_TOP3_TAIL_TO_OTHER_SINGLE_MIXTURE_UPDATE
+    source_missing_action: DIAGNOSTIC_SKIP_UPDATE_COUNT_TO_INCONCLUSIVE
+    association_semantics: [SOURCE_MISSING, NOVEL, CLUTTER, OTHER]
+    moved_semantics: DIAGNOSTIC_ONLY

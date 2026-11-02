@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Consume an already-running detector; no Gazebo, FAST-LIO or bag recorder. -->
+  <arg name="rviz" default="true" />
+  <include file="$(find deform_evolution_map)/launch/evolution.launch" />
+  <include file="$(find deform_avoidance_map)/launch/avoidance.launch" />
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="deform_analysis_rviz"
+        args="-d $(find deform_monitor_bringup)/config/rviz/full_system.rviz"
+        output="screen" />
+</launch>

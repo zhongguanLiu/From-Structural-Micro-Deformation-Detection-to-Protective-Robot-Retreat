@@ -1,0 +1,109 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+Preferences:
+  PromptSaveOnExit: false
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Background Color: 8; 8; 12
+    Fixed Frame: camera_init
+    Frame Rate: 20
+  Displays:
+    - Class: rviz/PointCloud2
+      Name: Registered scene
+      Enabled: true
+      Topic: /cloud_registered
+      Queue Size: 1
+      Color Transformer: FlatColor
+      Color: 190; 190; 195
+      Alpha: 0.5
+      Position Transformer: XYZ
+      Style: Points
+      Size (Pixels): 2
+      Decay Time: 0.5
+      Use Fixed Frame: true
+    - Class: rviz/Axes
+      Name: Sensor pose
+      Enabled: true
+      Reference Frame: body
+      Length: 0.5
+      Radius: 0.04
+    - Class: rviz/Path
+      Name: Robot trajectory
+      Enabled: true
+      Topic: /path
+      Color: 80; 200; 255
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.04
+      Buffer Length: 1
+    - Class: rviz/MarkerArray
+      Name: Micro-deformation (displacement x50)
+      Enabled: true
+      Marker Topic: /deform/v1/rviz/deformation_markers
+      Queue Size: 1
+      Namespaces:
+        reference_support: true
+        detection_probability: true
+        scaled_displacement: true
+    - Class: rviz/MarkerArray
+      Name: Monitoring status and experiment time
+      Enabled: true
+      Marker Topic: /deform/v1/rviz/status_markers
+      Queue Size: 1
+    - Class: rviz/Map
+      Name: Navigation map (optional)
+      Enabled: false
+      Topic: /mission/navigation_map
+      Alpha: 0.45
+      Color Scheme: map
+      Draw Behind: true
+    - Class: rviz/Map
+      Name: Deformation cost (optional)
+      Enabled: false
+      Topic: /deform/avoidance/current_overlay
+      Alpha: 0.65
+      Color Scheme: costmap
+    - Class: rviz/Path
+      Name: Navigation plan (closed loop)
+      Enabled: true
+      Topic: /move_base/NavfnROS/plan
+      Color: 255; 190; 60
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.06
+      Buffer Length: 1
+    - Class: rviz/MarkerArray
+      Name: Deformation evolution (optional)
+      Enabled: false
+      Marker Topic: /deform/evolution/markers
+      Queue Size: 1
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Name: Current View
+      Target Frame: body
+      Distance: 22
+      Pitch: 0.65
+      Yaw: 2.5
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 1.5
+      Near Clip Distance: 0.01
+    Saved: ~
+Window Geometry:
+  Width: 1500
+  Height: 1000
+  X: 1020
+  Y: 40
+  Hide Left Dock: false
+  Hide Right Dock: true

@@ -1,0 +1,133 @@
+<?xml version="1.0"?>
+<launch>
+  <env name="GAZEBO_MODEL_PATH" value="$(find livox_laser_simulation)/models:$(optenv GAZEBO_MODEL_PATH)" />
+  <arg name="world" default="$(find livox_laser_simulation)/worlds/tracked_mid360_fastlio_collapse_microdeform_sim.world" />
+  <arg name="model" default="$(find livox_laser_simulation)/urdf/mid360_fastlio.urdf.xacro" />
+  <arg name="robot_name" default="mid360_fastlio" />
+  <arg name="enable_lidar" default="true" />
+  <arg name="enable_rear_lidar" default="false" />
+  <arg name="enable_imu" default="true" />
+  <arg name="enable_planar_move" default="true" />
+  <arg name="visualize_lidar_rays" default="false" />
+  <arg name="lidar_update_rate_hz" default="10.0" />
+  <arg name="lidar_min_range_m" default="0.1" />
+  <arg name="lidar_max_range_m" default="100.0" />
+  <arg name="primary_lidar_downsample" default="1" />
+  <arg name="secondary_lidar_downsample" default="1" />
+  <arg name="lidar_point_time_mode" default="legacy_rolling" />
+  <arg name="spawn_robot" default="true" />
+  <arg name="gui" default="true" />
+  <arg name="rviz" default="false" />
+  <arg name="rviz_config" default="$(find livox_laser_simulation)/rviz/icra2027_a2_mid360.rviz" />
+  <arg name="publish_rviz_cloud" default="$(arg rviz)" />
+  <arg name="publish_joint_states" default="false" />
+  <arg name="publish_world_to_odom" default="false" />
+  <arg name="auto_drive" default="false" />
+  <arg name="x" default="1.291112" />
+  <arg name="y" default="-0.854969" />
+  <arg name="z" default="-0.000045" />
+  <arg name="yaw" default="1.570782" />
+  <arg name="paused" default="false" />
+  <arg name="lockstep" default="false" />
+  <arg name="scene_world" default="" />
+  <arg name="scene_record_directory" default="" />
+  <arg name="scene_motion_config" default="" />
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(arg world)" />
+    <arg name="paused" value="$(arg paused)" />
+    <arg name="use_sim_time" value="true" />
+    <arg name="gui" value="$(arg gui)" />
+    <arg name="headless" value="$(eval not arg('gui'))" />
+    <arg name="debug" value="false" />
+    <arg name="verbose" value="false" />
+    <arg name="extra_gazebo_args"
+         value="$(eval '--lockstep' if arg('lockstep') else '')" />
+  </include>
+
+  <param name="robot_description"
+         command="$(find xacro)/xacro '$(arg model)' enable_lidar:=$(arg enable_lidar) enable_rear_lidar:=$(arg enable_rear_lidar) enable_imu:=$(arg enable_imu) enable_planar_move:=$(arg enable_planar_move) visualize_lidar_rays:=$(arg visualize_lidar_rays) lidar_update_rate_hz:=$(arg lidar_update_rate_hz) lidar_min_range_m:=$(arg lidar_min_range_m) lidar_max_range_m:=$(arg lidar_max_range_m) lidar_point_time_mode:=$(arg lidar_point_time_mode) primary_lidar_downsample:=$(arg primary_lidar_downsample) secondary_lidar_downsample:=$(arg secondary_lidar_downsample)" />
+
+  <node
+    name="robot_state_publisher"
+    pkg="robot_state_publisher"
+    type="robot_state_publisher"
+    output="screen" />
+
+  <node if="$(arg publish_joint_states)"
+        name="a2_sim_clock_joint_state_publisher"
+        pkg="livox_laser_simulation"
+        type="sim_clock_joint_state_publisher.py"
+        output="screen">
+    <!-- Publish only after a valid Gazebo /clock sample.  This prevents one
+         wall-time joint sample followed by simulated-time samples from
+         producing a persistent TF_OLD_DATA warning storm.  The static A2
+         standing bias is baked into the joint origins; tiny nonzero DOF
+         values keep Gazebo and RViz numerically equivalent. -->
+    <param name="publish_rate_hz" value="2.0" />
+    <rosparam param="zeros">
+      FR_hip_joint: 1.0e-9
+      FR_thigh_joint: 1.0e-9
+      FR_calf_joint: 1.0e-9
+      FL_hip_joint: 1.0e-9
+      FL_thigh_joint: 1.0e-9
+      FL_calf_joint: 1.0e-9
+      RR_hip_joint: 1.0e-9
+      RR_thigh_joint: 1.0e-9
+      RR_calf_joint: 1.0e-9
+      RL_hip_joint: 1.0e-9
+      RL_thigh_joint: 1.0e-9
+      RL_calf_joint: 1.0e-9
+    </rosparam>
+  </node>
+
+  <node if="$(arg publish_world_to_odom)"
+        name="world_to_odom"
+        pkg="tf2_ros" type="static_transform_publisher"
+        args="0 0 0 0 0 0 world odom"/>
+
+  <node
+    if="$(arg spawn_robot)"
+    name="spawn_mobile_mid360"
+    pkg="livox_laser_simulation"
+    type="spawn_or_replace_model.py"
+    respawn="false"
+    output="screen">
+    <param name="model_name" value="$(arg robot_name)" />
+    <param name="scene_world" value="$(arg scene_world)" />
+    <param name="scene_record_directory" value="$(arg scene_record_directory)" />
+    <param name="scene_motion_config" value="$(arg scene_motion_config)" />
+    <param name="model_param" value="robot_description" />
+    <param name="robot_namespace" value="/" />
+    <param name="reference_frame" value="world" />
+    <param name="x" value="$(arg x)" />
+    <param name="y" value="$(arg y)" />
+    <param name="z" value="$(arg z)" />
+    <param name="yaw" value="$(arg yaw)" />
+  </node>
+
+  <node
+    if="$(arg auto_drive)"
+    name="mid360_auto_drive"
+    pkg="livox_laser_simulation"
+    type="circle_cmd.py"
+    output="screen">
+    <param name="linear_speed" value="0.3" />
+    <param name="angular_speed" value="0.093" />
+    <param name="publish_rate" value="20.0" />
+    <param name="start_delay" value="8.0" />
+  </node>
+
+  <node if="$(arg publish_rviz_cloud)"
+        name="livox_rviz_cloud_bridge"
+        pkg="livox_laser_simulation"
+        type="livox_custommsg_to_pointcloud2_node"
+        output="screen">
+    <param name="input_topic" value="/livox/lidar"/>
+    <param name="output_topic" value="/livox/pointcloud2"/>
+  </node>
+
+  <node if="$(arg rviz)" name="icra2027_rviz"
+        pkg="rviz" type="rviz" args="-d $(arg rviz_config)"
+        output="screen" required="false"/>
+</launch>

@@ -1,0 +1,21 @@
+<launch>
+  <arg name="config"
+       default="$(find dynablox_ros)/config/motion_detector/default.yaml" />
+  <arg name="input_topic" default="/cloud_registered_body" />
+  <arg name="dynamic_topic" default="/compare/dynablox/dynamic_points" />
+  <arg name="runtime_topic" default="/compare/dynablox/runtime" />
+
+  <node pkg="dynablox_ros" type="motion_detector" name="dynablox_compare"
+        output="log" required="true">
+    <rosparam command="load" file="$(arg config)" />
+    <param name="evaluate" value="false" />
+    <param name="visualize" value="false" />
+    <param name="verbose" value="false" />
+    <param name="shutdown_after" value="0" />
+    <param name="global_frame_name" value="camera_init" />
+    <param name="sensor_frame_name" value="body" />
+    <remap from="pointcloud" to="$(arg input_topic)" />
+    <remap from="~dynamic_points" to="$(arg dynamic_topic)" />
+    <remap from="~runtime" to="$(arg runtime_topic)" />
+  </node>
+</launch>

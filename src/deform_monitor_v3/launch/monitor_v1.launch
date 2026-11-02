@@ -1,0 +1,60 @@
+<launch>
+  <arg name="cloud_topic" default="/cloud_registered" />
+  <arg name="covariance_topic" default="/lio_odom_cov" />
+  <arg name="upstream_registered_cloud_deskew_verified" default="false" />
+  <arg name="upstream_stationary_pose_freeze_verified" default="false" />
+  <arg name="visibility_min_range_m" default="0.30" />
+  <arg name="visibility_max_range_m" default="40.0" />
+  <arg name="rviz_adapter" default="true" />
+  <arg name="displacement_display_scale" default="50.0" />
+  <arg name="minimum_display_arrow_m" default="0.005" />
+  <arg name="minimum_arrow_active_probability" default="0.0" />
+  <arg name="parameter_overrides" default="" />
+  <arg name="use_fastlio_extrinsic" default="false" />
+  <arg name="status_position_x" default="-4.0" />
+  <arg name="status_position_y" default="-4.0" />
+  <arg name="status_position_z" default="3.0" />
+  <arg name="status_detail_topic" default="" />
+  <arg name="monitor_launch_prefix" default="" />
+  <node pkg="deform_monitor_v3" type="deform_monitor_v1_node"
+        name="deform_monitor_v1" output="screen" required="true"
+        launch-prefix="$(arg monitor_launch_prefix)">
+    <param name="config_sources/algorithm"
+           value="$(find deform_monitor_v3)/config/v1/algorithm_v1.yaml" />
+    <param name="config_sources/resource"
+           value="$(find deform_monitor_v3)/config/v1/resource_v1.yaml" />
+    <param name="config_sources/calibration"
+           value="$(find deform_monitor_v3)/config/v1/calibration_uncalibrated.yaml" />
+    <rosparam command="load" file="$(find deform_monitor_v3)/config/v1/algorithm_v1.yaml" />
+    <rosparam command="load" file="$(find deform_monitor_v3)/config/v1/resource_v1.yaml" />
+    <rosparam command="load" file="$(find deform_monitor_v3)/config/v1/calibration_uncalibrated.yaml" />
+    <rosparam if="$(eval arg('parameter_overrides') != '')" command="load"
+              file="$(arg parameter_overrides)" />
+    <param name="use_fastlio_extrinsic" value="$(arg use_fastlio_extrinsic)" />
+    <param name="v1/io/cloud_topic" value="$(arg cloud_topic)" />
+    <param name="v1/io/covariance_topic" value="$(arg covariance_topic)" />
+    <param name="v1/resource/upstream_registered_cloud_deskew_verified"
+           value="$(arg upstream_registered_cloud_deskew_verified)" />
+    <param name="v1/resource/upstream_stationary_pose_freeze_verified"
+           value="$(arg upstream_stationary_pose_freeze_verified)" />
+    <param name="v1/calibration/visibility_min_range_m"
+           value="$(arg visibility_min_range_m)" />
+    <param name="v1/calibration/visibility_max_range_m"
+           value="$(arg visibility_max_range_m)" />
+  </node>
+  <node if="$(arg rviz_adapter)" pkg="deform_monitor_v3"
+        type="deform_monitor_v1_rviz_node" name="deform_monitor_v1_rviz"
+        output="screen" required="true">
+    <!-- Display amplification affects markers only; estimator messages remain SI. -->
+    <param name="displacement_display_scale"
+           value="$(arg displacement_display_scale)" />
+    <param name="minimum_display_arrow_m"
+           value="$(arg minimum_display_arrow_m)" />
+    <param name="minimum_arrow_active_probability"
+           value="$(arg minimum_arrow_active_probability)" />
+    <param name="status_position_x" value="$(arg status_position_x)" />
+    <param name="status_position_y" value="$(arg status_position_y)" />
+    <param name="status_position_z" value="$(arg status_position_z)" />
+    <param name="status_detail_topic" value="$(arg status_detail_topic)" />
+  </node>
+</launch>

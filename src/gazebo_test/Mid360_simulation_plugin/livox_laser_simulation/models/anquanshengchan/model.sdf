@@ -1,0 +1,43 @@
+<?xml version='1.0'?>
+<sdf version='1.7'>
+  <model name='anquanshengchan'>
+    <static>1</static>
+    <link name='link_0'>
+      <visual name='visual'>
+        <geometry>
+          <mesh>
+            <uri>model://anquanshengchan/meshes/anquanshengchan.dae</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
+        <transparency>0</transparency>
+        <cast_shadows>1</cast_shadows>
+      </visual>
+      <collision name='collision'>
+        <laser_retro>0</laser_retro>
+        <max_contacts>10</max_contacts>
+        <geometry>
+          <mesh>
+            <uri>model://anquanshengchan/meshes/anquanshengchan_collision.obj</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>1</mu>
+              <mu2>1</mu2>
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <kp>1e+13</kp>
+              <kd>1</kd>
+              <max_vel>0.01</max_vel>
+            </ode>
+          </contact>
+        </surface>
+      </collision>
+    </link>
+  </model>
+</sdf>

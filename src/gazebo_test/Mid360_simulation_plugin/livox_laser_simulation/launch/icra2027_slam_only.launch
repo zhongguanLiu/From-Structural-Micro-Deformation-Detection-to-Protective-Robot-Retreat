@@ -1,0 +1,8 @@
+<launch>
+  <!-- This launch NEVER starts Gazebo and NEVER spawns a robot.
+       Start icra2027_simulation.launch first in another terminal. -->
+  <arg name="rviz" default="false"/>
+  <include file="$(find fast_lio)/launch/mapping_mid360.launch">
+    <arg name="rviz" value="$(arg rviz)"/>
+  </include>
+</launch>

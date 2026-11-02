@@ -1,0 +1,21 @@
+# Recorder-only Gazebo truth configuration.
+#
+# This file must be loaded only in icra2027_experiment_recorder.  Its model
+# names, association tolerances and truth-frame calibration are permitted for
+# post-detection metric computation; they must never enter the detector,
+# mission trigger, evolution map, avoidance map or planner namespaces.
+mission:
+  required_detection_models: [m01, m02, m03, m05, m06]
+  model_association_tolerance_m:
+    m01: [1.80, 1.20]
+    m02: [2.60, 1.80]
+    m03: [2.80, 1.80]
+    m04: [1.80, 2.00]
+    m05: [1.90, 1.70]
+    m06: [3.20, 1.40]
+
+  # Gazebo model origin (base_footprint) -> FAST-LIO body (front IMU),
+  # measured from the fixed URDF TF chain.  This simulation-only transform is
+  # used solely to align independent truth and estimated trajectories during
+  # offline/recorder metric calculation.
+  truth_model_to_fastlio_body_xyzyaw: [0.2801, 0.0, 0.616928878, 0.0]

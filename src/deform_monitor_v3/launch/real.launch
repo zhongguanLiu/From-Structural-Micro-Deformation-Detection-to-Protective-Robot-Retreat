@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- User starts the in-repository FAST-LIO and bag playback separately. -->
+  <arg name="use_sim_time" default="true" />
+  <arg name="rviz" default="true" />
+  <arg name="record" default="false" />
+  <arg name="output_root" default="$(eval optenv('DEFORM_MONITOR_OUTPUT_ROOT', find('deform_monitor_bringup') + '/../../experiment_output') + '/real')" />
+  <arg name="source_bag" default="" />
+  <arg name="real_parameters" default="$(find deform_monitor_v3)/config/v1/real_overrides.yaml" />
+  <!-- Display thresholds only; not a calibrated detection decision. -->
+  <arg name="minimum_display_arrow_m" default="0.05" />
+  <arg name="minimum_arrow_active_probability" default="0.95" />
+  <param name="/use_sim_time" value="$(arg use_sim_time)" />
+
+  <include file="$(find deform_monitor_v3)/launch/monitor_v1.launch">
+    <!-- This entry consumes the in-repository FAST-LIO's deskewed output. -->
+    <arg name="upstream_registered_cloud_deskew_verified" value="true" />
+    <arg name="parameter_overrides" value="$(arg real_parameters)" />
+    <arg name="use_fastlio_extrinsic" value="true" />
+    <arg name="minimum_display_arrow_m" value="$(arg minimum_display_arrow_m)" />
+    <arg name="minimum_arrow_active_probability" value="$(arg minimum_arrow_active_probability)" />
+  </include>
+
+  <node if="$(arg record)" pkg="deform_monitor_v3" type="v1_real_recorder.py"
+        name="deform_v1_real_recorder" output="screen" required="true">
+    <param name="output_root" value="$(arg output_root)" />
+    <param name="source_bag" value="$(arg source_bag)" />
+  </node>
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="deform_real_rviz"
+        args="-d $(find deform_monitor_v3)/config/rviz/v1_simulation.rviz"
+        output="screen" />
+</launch>

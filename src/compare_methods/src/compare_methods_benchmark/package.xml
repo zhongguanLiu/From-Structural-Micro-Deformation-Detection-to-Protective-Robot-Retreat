@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>compare_methods_benchmark</name>
+  <version>0.1.0</version>
+  <description>Single-LiDAR ICRA2027 benchmark wiring and compact recorder.</description>
+  <maintainer email="zgliu@example.com">zgliu</maintainer>
+  <license>BSD-3-Clause</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>fast_lio</exec_depend>
+  <exec_depend>livox_laser_simulation</exec_depend>
+  <exec_depend>m_detector</exec_depend>
+  <exec_depend>dynamic_detector</exec_depend>
+  <exec_depend>dynablox_ros</exec_depend>
+  <exec_depend>m3c2_baseline</exec_depend>
+</package>

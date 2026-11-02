@@ -1,0 +1,9 @@
+deform_monitor_v3/V1StableId128 snapshot_token
+string robot_geometry_revision
+string policy_revision
+deform_monitor_v3/V1TimedRobotPose[] path
+---
+bool accepted
+deform_monitor_v3/V1StableId128 registration_token
+deform_monitor_v3/V1RiskAssessment assessment
+uint16[] reason_codes

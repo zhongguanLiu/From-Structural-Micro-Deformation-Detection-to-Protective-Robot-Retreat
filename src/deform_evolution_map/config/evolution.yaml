@@ -1,0 +1,24 @@
+deform_evolution:
+  input_topic: /deform/v1/detection_tiles
+  output_topic: /deform/evolution/frame
+  marker_topic: /deform/evolution/markers
+  activation_mode: RESEARCH_POSTERIOR
+  research_probability_threshold: 0.80
+  research_clear_probability_threshold: 0.05
+  research_minimum_displacement_m: 0.0005
+  research_require_mde: false
+  # A raw active_now remains visible immediately, but a new generic GDU enters
+  # the retained avoidance layer only after this many independent, fresh,
+  # observable active LOD2 measurements. A rank-zero/CTMC-only frame pauses
+  # this count; a fresh observable non-active measurement resets it.
+  retained_birth_confirmations: 3
+  # Paused confirmations cannot survive indefinitely. If the elapsed time
+  # since the first active confirmation exceeds this finite window, the next
+  # frame resets (or restarts) the pending birth.
+  pending_confirmation_timeout_s: 15.0
+  clear_confirmations: 3
+  magnitude_change_minimum_m: 0.0005
+  magnitude_change_sigma_factor: 1.0
+  prediction_horizons_s: [0.5, 1.0, 2.0]
+  displacement_display_scale: 50.0
+  maximum_display_arrow_m: 1.0

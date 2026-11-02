@@ -1,0 +1,4 @@
+deform_monitor_v3/V1Common common
+string policy_revision
+deform_monitor_v3/V1RiskAssessment aggregate_assessment
+deform_monitor_v3/V1RiskConfigurationSample[] configuration_samples

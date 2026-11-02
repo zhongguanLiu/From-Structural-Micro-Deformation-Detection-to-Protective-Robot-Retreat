@@ -1,0 +1,3685 @@
+#include "deform_monitor_v3/deform_monitor_v3_node.hpp"
+
+#include "deform_monitor_v3/core/observable_subspace.hpp"
+
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <ctime>
+#include <exception>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <thread>
+#include <unistd.h>
+
+#include <Eigen/Eigenvalues>
+#include <deform_monitor_v3/StructureMotions.h>
+#include <pcl/common/io.h>
+#include <pcl_conversions/pcl_conversions.h>
+
+namespace deform_monitor_v3 {
+
+namespace {
+
+constexpr double kDiagnosticsAlertPlusPlusRefreshSec = 5.0;
+
+struct SpatialVoxelKey {
+  int x = 0;
+  int y = 0;
+  int z = 0;
+
+  bool operator==(const SpatialVoxelKey& other) const {
+    return x == other.x && y == other.y && z == other.z;
+  }
+};
+
+struct SpatialVoxelKeyHash {
+  size_t operator()(const SpatialVoxelKey& key) const {
+    size_t h = std::hash<int>()(key.x);
+    h ^= std::hash<int>()(key.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>()(key.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+template <typename T>
+T LoadParam(ros::NodeHandle& nh, const std::string& name, const T& default_value) {
+  T value = default_value;
+  if (nh.getParam(name, value)) {
+    return value;
+  }
+  ros::param::param<T>("/" + name, value, default_value);
+  return value;
+}
+
+template <typename QueueT>
+void TrimQueue(QueueT* queue, size_t max_size) {
+  while (queue && queue->size() > max_size) {
+    queue->pop_front();
+  }
+}
+
+double Clamp01(double value) {
+  return std::max(0.0, std::min(1.0, value));
+}
+
+uint64_t MixAnchorSelectionKey(uint64_t value) {
+  value += 0x9e3779b97f4a7c15ULL;
+  value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+  value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+  return value ^ (value >> 31U);
+}
+
+uint64_t AnchorSelectionKey(const AnchorReference& anchor) {
+  const int64_t qx = static_cast<int64_t>(std::llround(anchor.center_R.x() * 10000.0));
+  const int64_t qy = static_cast<int64_t>(std::llround(anchor.center_R.y() * 10000.0));
+  const int64_t qz = static_cast<int64_t>(std::llround(anchor.center_R.z() * 10000.0));
+  uint64_t key = MixAnchorSelectionKey(static_cast<uint64_t>(qx));
+  key ^= MixAnchorSelectionKey(static_cast<uint64_t>(qy) + 0x517cc1b727220a95ULL);
+  key ^= MixAnchorSelectionKey(static_cast<uint64_t>(qz) + 0x6eed0e9da4d94a4fULL);
+  return key;
+}
+
+void ApplyDeterministicAnchorKeepRatio(double keep_ratio,
+                                       AnchorReferenceVector* anchors) {
+  if (!anchors || anchors->empty() || keep_ratio >= 1.0) {
+    return;
+  }
+  const size_t original_count = anchors->size();
+  const size_t target_count = std::max<size_t>(
+      1, static_cast<size_t>(std::llround(keep_ratio * original_count)));
+  std::sort(anchors->begin(), anchors->end(),
+            [](const AnchorReference& lhs, const AnchorReference& rhs) {
+              const uint64_t lhs_key = AnchorSelectionKey(lhs);
+              const uint64_t rhs_key = AnchorSelectionKey(rhs);
+              if (lhs_key != rhs_key) {
+                return lhs_key < rhs_key;
+              }
+              return lhs.id < rhs.id;
+            });
+  anchors->resize(target_count);
+  for (size_t i = 0; i < anchors->size(); ++i) {
+    (*anchors)[i].id = static_cast<int>(i);
+  }
+  ROS_INFO("[runtime_scaling] retained %zu/%zu frozen anchors (ratio=%.3f)",
+           anchors->size(), original_count, keep_ratio);
+}
+
+pcl::PointCloud<pcl::PointXYZI>::Ptr TransformCloud(
+    const pcl::PointCloud<pcl::PointXYZI>::ConstPtr& in,
+    const Eigen::Isometry3d& T) {
+  pcl::PointCloud<pcl::PointXYZI>::Ptr out(new pcl::PointCloud<pcl::PointXYZI>());
+  if (!in) {
+    return out;
+  }
+  out->reserve(in->size());
+  for (const auto& pt : in->points) {
+    Eigen::Vector3d p = T * Eigen::Vector3d(pt.x, pt.y, pt.z);
+    pcl::PointXYZI out_pt = pt;
+    out_pt.x = static_cast<float>(p.x());
+    out_pt.y = static_cast<float>(p.y());
+    out_pt.z = static_cast<float>(p.z());
+    out->points.push_back(out_pt);
+  }
+  out->width = out->points.size();
+  out->height = 1;
+  out->is_dense = false;
+  return out;
+}
+
+double InverseNormalCdf(double p) {
+  // Acklam rational approximation.
+  static const double a1 = -3.969683028665376e+01;
+  static const double a2 = 2.209460984245205e+02;
+  static const double a3 = -2.759285104469687e+02;
+  static const double a4 = 1.383577518672690e+02;
+  static const double a5 = -3.066479806614716e+01;
+  static const double a6 = 2.506628277459239e+00;
+
+  static const double b1 = -5.447609879822406e+01;
+  static const double b2 = 1.615858368580409e+02;
+  static const double b3 = -1.556989798598866e+02;
+  static const double b4 = 6.680131188771972e+01;
+  static const double b5 = -1.328068155288572e+01;
+
+  static const double c1 = -7.784894002430293e-03;
+  static const double c2 = -3.223964580411365e-01;
+  static const double c3 = -2.400758277161838e+00;
+  static const double c4 = -2.549732539343734e+00;
+  static const double c5 = 4.374664141464968e+00;
+  static const double c6 = 2.938163982698783e+00;
+
+  static const double d1 = 7.784695709041462e-03;
+  static const double d2 = 3.224671290700398e-01;
+  static const double d3 = 2.445134137142996e+00;
+  static const double d4 = 3.754408661907416e+00;
+
+  const double plow = 0.02425;
+  const double phigh = 1.0 - plow;
+
+  if (p <= 0.0) {
+    return -std::numeric_limits<double>::infinity();
+  }
+  if (p >= 1.0) {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  if (p < plow) {
+    const double q = std::sqrt(-2.0 * std::log(p));
+    return (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+           ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
+  }
+  if (p > phigh) {
+    const double q = std::sqrt(-2.0 * std::log(1.0 - p));
+    return -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+           ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
+  }
+
+  const double q = p - 0.5;
+  const double r = q * q;
+  return (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q /
+         (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0);
+}
+
+double Chi2ThresholdByDof(int dof, double alpha_s) {
+  if (dof <= 0) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const double p = std::max(1.0e-6, std::min(1.0 - 1.0e-6, 1.0 - alpha_s));
+  const double z = InverseNormalCdf(p);
+  const double k = static_cast<double>(dof);
+  const double base = 1.0 - 2.0 / (9.0 * k) + z * std::sqrt(2.0 / (9.0 * k));
+  return k * base * base * base;
+}
+
+std::string DetectionModeToString(DetectionMode mode) {
+  switch (mode) {
+    case DetectionMode::NONE:
+      return "NONE";
+    case DetectionMode::DISPLACEMENT:
+      return "DISPLACEMENT";
+    case DetectionMode::DISAPPEARANCE:
+      return "DISAPPEARANCE";
+  }
+  return "UNKNOWN";
+}
+
+std::string AnchorTypeToString(AnchorType type) {
+  switch (type) {
+    case AnchorType::PLANE:
+      return "PLANE";
+    case AnchorType::EDGE:
+      return "EDGE";
+    case AnchorType::BAND:
+      return "BAND";
+  }
+  return "UNKNOWN";
+}
+
+std::string ObsGateStateToString(ObsGateState state) {
+  switch (state) {
+    case ObsGateState::NOT_OBSERVABLE:
+      return "NOT_OBSERVABLE";
+    case ObsGateState::OBSERVABLE_MATCHED:
+      return "OBSERVABLE_MATCHED";
+    case ObsGateState::OBSERVABLE_WEAK:
+      return "OBSERVABLE_WEAK";
+    case ObsGateState::OBSERVABLE_MISSING:
+      return "OBSERVABLE_MISSING";
+    case ObsGateState::OBSERVABLE_REPLACED:
+      return "OBSERVABLE_REPLACED";
+  }
+  return "UNKNOWN";
+}
+
+std::string ObsStatusToString(ObsStatus status) {
+  switch (status) {
+    case ObsStatus::INVALID_NO_COMPARISON:
+      return "INVALID_NO_COMPARISON";
+    case ObsStatus::VALID_PARTIAL_OBS:
+      return "VALID_PARTIAL_OBS";
+    case ObsStatus::VALID_FULL_OBS:
+      return "VALID_FULL_OBS";
+  }
+  return "UNKNOWN";
+}
+
+std::string FormatVec3(const Eigen::Vector3d& v) {
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(4)
+      << "(" << v.x() << "," << v.y() << "," << v.z() << ")";
+  return oss.str();
+}
+
+bool EnsureDirectoryExists(const std::string& path) {
+  if (path.empty()) {
+    return false;
+  }
+
+  struct stat info;
+  if (stat(path.c_str(), &info) == 0) {
+    return S_ISDIR(info.st_mode);
+  }
+
+  std::string current;
+  if (!path.empty() && path.front() == '/') {
+    current = "/";
+  }
+
+  std::stringstream ss(path);
+  std::string segment;
+  while (std::getline(ss, segment, '/')) {
+    if (segment.empty()) {
+      continue;
+    }
+    if (!current.empty() && current.back() != '/') {
+      current += "/";
+    }
+    current += segment;
+
+    if (stat(current.c_str(), &info) == 0) {
+      if (!S_ISDIR(info.st_mode)) {
+        return false;
+      }
+      continue;
+    }
+    if (mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) {
+      return false;
+    }
+  }
+
+  return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+std::string MakeRunLogFilename() {
+  const std::time_t now = std::time(nullptr);
+  std::tm local_tm;
+  localtime_r(&now, &local_tm);
+  char buffer[64];
+  if (std::strftime(buffer, sizeof(buffer), "%Y%m%d_%H%M%S", &local_tm) == 0) {
+    return "anchor_diagnostics_unknown.log";
+  }
+  std::ostringstream oss;
+  oss << "anchor_diagnostics_" << buffer << "_pid" << static_cast<long>(::getpid()) << ".log";
+  return oss.str();
+}
+
+std::string FormatTimeJson(const ros::Time& stamp) {
+  std::ostringstream oss;
+  oss << "{\"secs\":" << stamp.sec
+      << ",\"nsecs\":" << stamp.nsec
+      << ",\"sec\":" << std::fixed << std::setprecision(9) << stamp.toSec()
+      << "}";
+  return oss.str();
+}
+
+template <typename Fn>
+void ParallelFor(size_t count, Fn&& fn) {
+  if (count == 0) {
+    return;
+  }
+
+  const size_t hardware_threads =
+      std::max<size_t>(1, static_cast<size_t>(std::thread::hardware_concurrency()));
+  const size_t worker_count = std::min(count, hardware_threads);
+  if (worker_count < 2 || count < 256) {
+    for (size_t i = 0; i < count; ++i) {
+      fn(i);
+    }
+    return;
+  }
+
+  const size_t block_size = (count + worker_count - 1) / worker_count;
+  std::vector<std::thread> workers;
+  workers.reserve(worker_count - 1);
+  std::mutex exception_mutex;
+  std::exception_ptr first_exception;
+
+  auto run_block = [&](size_t begin, size_t end) {
+    try {
+      for (size_t i = begin; i < end; ++i) {
+        fn(i);
+      }
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(exception_mutex);
+      if (!first_exception) {
+        first_exception = std::current_exception();
+      }
+    }
+  };
+
+  for (size_t worker_idx = 1; worker_idx < worker_count; ++worker_idx) {
+    const size_t begin = worker_idx * block_size;
+    if (begin >= count) {
+      break;
+    }
+    const size_t end = std::min(count, begin + block_size);
+    workers.emplace_back(run_block, begin, end);
+  }
+
+  run_block(0, std::min(count, block_size));
+
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  if (first_exception) {
+    std::rethrow_exception(first_exception);
+  }
+}
+
+}  // namespace
+
+ScopedWallTimer::ScopedWallTimer(double* accumulator_ms)
+    : accumulator_ms_(accumulator_ms),
+      start_time_(std::chrono::steady_clock::now()) {}
+
+ScopedWallTimer::~ScopedWallTimer() {
+  if (!accumulator_ms_) {
+    return;
+  }
+  const auto end_time = std::chrono::steady_clock::now();
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(end_time - start_time_);
+  *accumulator_ms_ += elapsed.count();
+}
+
+StageRuntimeLogger::~StageRuntimeLogger() {
+  Close();
+}
+
+bool StageRuntimeLogger::Initialize(const std::string& output_dir) {
+  if (initialized_) {
+    return true;
+  }
+  if (output_dir.empty() || !EnsureDirectoryExists(output_dir)) {
+    return false;
+  }
+
+  log_path_ = output_dir + "/stage_runtime.jsonl";
+  stream_.open(log_path_.c_str(), std::ios::out | std::ios::app);
+  initialized_ = stream_.is_open();
+  if (!initialized_) {
+    log_path_.clear();
+  }
+  return initialized_;
+}
+
+bool StageRuntimeLogger::Write(const StageRuntimeRecord& record) {
+  if (!initialized_ || !stream_.is_open()) {
+    return false;
+  }
+
+  stream_ << "{\"stamp\":" << FormatTimeJson(record.stamp)
+          << ",\"frame_index\":" << record.frame_index
+          << ",\"reference_epoch\":" << record.reference_epoch
+          << ",\"total_ms\":" << std::fixed << std::setprecision(3) << record.total_ms
+          << ",\"stage_a_ms\":" << record.stage_a_ms
+          << ",\"stage_b_ms\":" << record.stage_b_ms
+          << ",\"stage_a_prepare_ms\":" << record.stage_a_prepare_ms
+          << ",\"stage_a_extract_ms\":" << record.stage_a_extract_ms
+          << ",\"stage_b_predict_ms\":" << record.stage_b_predict_ms
+          << ",\"stage_b_update_ms\":" << record.stage_b_update_ms
+          << ",\"stage_b_statistics_ms\":" << record.stage_b_statistics_ms
+          << ",\"stage_c_ms\":" << record.stage_c_ms
+          << ",\"stage_c_cusum_ms\":" << record.stage_c_cusum_ms
+          << ",\"stage_c_local_contrast_ms\":" << record.stage_c_local_contrast_ms
+          << ",\"stage_c_graph_temporal_ms\":" << record.stage_c_graph_temporal_ms
+          << ",\"stage_c_weak_plane_ms\":" << record.stage_c_weak_plane_ms
+          << ",\"stage_c_significance_ms\":" << record.stage_c_significance_ms
+          << ",\"stage_d_ms\":" << record.stage_d_ms
+          << ",\"stage_d_bias_ms\":" << record.stage_d_bias_ms
+          << ",\"stage_d_cluster_ms\":" << record.stage_d_cluster_ms
+          << ",\"stage_d_structure_ms\":" << record.stage_d_structure_ms
+          << ",\"stage_d_risk_ms\":" << record.stage_d_risk_ms
+          << ",\"stage_d_persistent_track_ms\":" << record.stage_d_persistent_track_ms
+          << ",\"stage_d_ref_stats_ms\":" << record.stage_d_ref_stats_ms
+          << ",\"stage_d_structure_unit_ms\":" << record.stage_d_structure_unit_ms
+          << ",\"stage_d_incremental_ms\":" << record.stage_d_incremental_ms
+          << ",\"stage_d_publish_ms\":" << record.stage_d_publish_ms
+          << ",\"input_frame_count\":" << record.input_frame_count
+          << ",\"input_point_count\":" << record.input_point_count
+          << ",\"input_point_counts_by_frame\":[";
+  for (size_t i = 0; i < record.input_point_counts_by_frame.size(); ++i) {
+    if (i > 0) {
+      stream_ << ',';
+    }
+    stream_ << record.input_point_counts_by_frame[i];
+  }
+  stream_ << "]"
+          << ",\"anchor_count\":" << record.anchor_count
+          << ",\"comparable_anchor_count\":" << record.comparable_anchor_count
+          << ",\"significant_anchor_count\":" << record.significant_anchor_count
+          << ",\"cluster_count\":" << record.cluster_count
+          << ",\"risk_evidence_count\":" << record.risk_evidence_count
+          << ",\"risk_voxel_count\":" << record.risk_voxel_count
+          << ",\"risk_region_count\":" << record.risk_region_count
+          << ",\"persistent_track_count\":" << record.persistent_track_count
+          << "}" << std::endl;
+  stream_.flush();
+  return stream_.good();
+}
+
+void StageRuntimeLogger::Close() {
+  if (stream_.is_open()) {
+    stream_.flush();
+    stream_.close();
+  }
+  initialized_ = false;
+  log_path_.clear();
+}
+
+DeformMonitorV3Node::DeformMonitorV3Node() : private_nh_("~") {
+  LoadParameters();
+  reference_observation_stats_.SetParams(params_.object_association);
+
+  cloud_sub_ = nh_.subscribe(params_.io.cloud_topic, 20, &DeformMonitorV3Node::CloudCallback, this);
+  covariance_sub_ =
+      nh_.subscribe(params_.io.covariance_topic, 50, &DeformMonitorV3Node::CovarianceCallback, this);
+  reset_reference_sub_ =
+      nh_.subscribe(params_.io.reset_reference_topic,
+                    2,
+                    &DeformMonitorV3Node::ResetReferenceCallback,
+                    this);
+
+  anchors_pub_ = nh_.advertise<deform_monitor_v3::AnchorStates>("/deform/anchors", 30, true);
+  clusters_pub_ = nh_.advertise<deform_monitor_v3::MotionClusters>("/deform/clusters", 10, true);
+  debug_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/deform/debug_cloud", 10, true);
+  anchor_markers_pub_ =
+      nh_.advertise<visualization_msgs::MarkerArray>("/deform/anchor_markers", 10, true);
+  motion_markers_pub_ =
+      nh_.advertise<visualization_msgs::MarkerArray>("/deform/motion_markers", 10, true);
+  object_observation_stats_pub_ =
+      nh_.advertise<deform_monitor_v3::ObjectObservationStats>(
+          "/deform/object_observation_stats", 10, true);
+  risk_evidence_pub_ =
+      nh_.advertise<deform_monitor_v3::RiskEvidenceArray>("/deform/risk_evidence", 10, true);
+  risk_voxels_pub_ =
+      nh_.advertise<deform_monitor_v3::RiskVoxelField>("/deform/risk_voxels", 10, true);
+  risk_regions_pub_ =
+      nh_.advertise<deform_monitor_v3::RiskRegions>("/deform/risk_regions", 10, true);
+  risk_markers_pub_ =
+      nh_.advertise<visualization_msgs::MarkerArray>("/deform/risk_markers", 10, true);
+  persistent_risk_regions_pub_ = nh_.advertise<deform_monitor_v3::PersistentRiskRegions>(
+      "/deform/persistent_risk_regions", 10, true);
+  persistent_risk_markers_pub_ = nh_.advertise<visualization_msgs::MarkerArray>(
+      "/deform/persistent_risk_markers", 10, true);
+  structure_motions_pub_ =
+      nh_.advertise<deform_monitor_v3::StructureMotions>("/deform/structure_motions", 10, true);
+  structure_markers_pub_ =
+      nh_.advertise<visualization_msgs::MarkerArray>("/deform/structure_markers", 10, true);
+  probabilistic_risk_map_pub_ = nh_.advertise<deform_monitor_v3::ProbabilisticRiskMap>(
+      "/deform/probabilistic_risk/map", 1, true);
+  probabilistic_risk_regions_pub_ = nh_.advertise<deform_monitor_v3::ProbabilisticRiskRegions>(
+      "/deform/probabilistic_risk/regions", 1, true);
+  risk_map_exporter_.Start(risk_map_params_, params_.io.reference_frame);
+
+  InitializeDiagnosticsLog();
+  PrintStartupSummary();
+}
+
+void DeformMonitorV3Node::InitializeDiagnosticsLog() {
+  std::string log_dir = "log";
+#ifdef DEFORM_MONITOR_V3_SOURCE_DIR
+  log_dir = std::string(DEFORM_MONITOR_V3_SOURCE_DIR) + "/log";
+#endif
+  if (!EnsureDirectoryExists(log_dir)) {
+    std::cerr << "[微动监测V3] 诊断日志目录创建失败: " << log_dir << std::endl;
+    return;
+  }
+
+  diagnostics_log_path_ = log_dir + "/" + MakeRunLogFilename();
+  diagnostics_log_.open(diagnostics_log_path_.c_str(), std::ios::out | std::ios::trunc);
+  if (!diagnostics_log_.is_open()) {
+    std::cerr << "[微动监测V3] 无法打开诊断日志文件: " << diagnostics_log_path_ << std::endl;
+    diagnostics_log_path_.clear();
+    return;
+  }
+
+  diagnostics_log_ << "# Deform Monitor V3 Anchor Diagnostics" << std::endl;
+  diagnostics_log_ << "node=" << ros::this_node::getName() << std::endl;
+  diagnostics_log_ << "pid=" << static_cast<long>(::getpid()) << std::endl;
+  diagnostics_log_ << "wall_start=" << ros::WallTime::now().toSec() << std::endl;
+  diagnostics_log_ << "cloud_topic=" << params_.io.cloud_topic
+                   << " covariance_topic=" << params_.io.covariance_topic << std::endl;
+  diagnostics_log_ << "temporal.enable=" << (params_.temporal.enable ? 1 : 0)
+                   << " window_frames=" << params_.temporal.window_frames
+                   << " min_frames=" << params_.temporal.min_frames
+                   << " step_frames=" << params_.temporal.step_frames
+                   << " max_window_sec=" << params_.temporal.max_window_sec
+                   << " use_stable_voxel_fusion="
+                   << (params_.temporal.use_stable_voxel_fusion ? 1 : 0)
+                   << " min_fused_visible_frames=" << params_.temporal.min_fused_visible_frames
+                   << " min_fused_points_per_voxel=" << params_.temporal.min_fused_points_per_voxel
+                   << std::endl;
+  diagnostics_log_ << "significance.alpha_s=" << params_.significance.alpha_s
+                   << " tau_A_norm=" << params_.significance.tau_A_norm
+                   << " tau_A_normal=" << params_.significance.tau_A_normal
+                   << " tau_A_edge=" << params_.significance.tau_A_edge
+                   << " tau_disappear=" << params_.significance.tau_disappear
+                   << " disappear_frames=" << params_.significance.disappear_frames << std::endl;
+  diagnostics_log_ << "local_contrast.enable=" << (params_.local_contrast.enable ? 1 : 0)
+                   << " min_neighbors=" << params_.local_contrast.min_neighbors
+                   << " tau_contrast_score=" << params_.local_contrast.tau_contrast_score
+                   << " tau_rel_norm=" << params_.local_contrast.tau_rel_norm
+                   << " tau_rel_normal=" << params_.local_contrast.tau_rel_normal
+                   << " tau_rel_edge=" << params_.local_contrast.tau_rel_edge << std::endl;
+  diagnostics_log_ << "graph_temporal.enable=" << (params_.graph_temporal.enable ? 1 : 0)
+                   << " min_neighbors=" << params_.graph_temporal.min_neighbors
+                   << " tau_graph_support=" << params_.graph_temporal.tau_graph_support
+                   << " tau_graph_temporal=" << params_.graph_temporal.tau_graph_temporal
+                   << " cusum_h=" << params_.graph_temporal.cusum_h << std::endl;
+  diagnostics_log_ << "ablation.variant=" << params_.ablation.variant
+                   << " disable_covariance_inflation="
+                   << (params_.ablation.disable_covariance_inflation ? 1 : 0)
+                   << " disable_type_constraint="
+                   << (params_.ablation.disable_type_constraint ? 1 : 0)
+                   << " single_model_ekf=" << (params_.ablation.single_model_ekf ? 1 : 0)
+                   << " disable_cusum=" << (params_.ablation.disable_cusum ? 1 : 0)
+                   << " disable_directional_accumulation="
+                   << (params_.ablation.disable_directional_accumulation ? 1 : 0)
+                   << " disable_drift_compensation="
+                   << (params_.ablation.disable_drift_compensation ? 1 : 0) << std::endl;
+  diagnostics_log_ << "visualization.min_arrow_disp=" << params_.visualization.min_arrow_disp
+                   << " min_arrow_contrast_score=" << params_.visualization.min_arrow_contrast_score
+                   << " arrows_only_clustered_or_reacquired="
+                   << (params_.visualization.arrows_only_clustered_or_reacquired ? 1 : 0)
+                   << std::endl;
+  diagnostics_log_ << std::endl;
+  diagnostics_log_.flush();
+
+  std::cout << "[微动监测V3] 诊断日志文件: " << diagnostics_log_path_ << std::endl;
+}
+
+void DeformMonitorV3Node::ShutdownDiagnosticsLog() {
+  if (diagnostics_log_.is_open()) {
+    diagnostics_log_ << "[SHUTDOWN] wall_time=" << ros::WallTime::now().toSec() << std::endl;
+    diagnostics_log_.flush();
+    diagnostics_log_.close();
+  }
+  runtime_logger_.Close();
+}
+
+void DeformMonitorV3Node::MaybeInitializeRuntimeLog() {
+  if (runtime_logger_.is_initialized()) {
+    return;
+  }
+
+  std::string output_dir = runtime_output_dir_;
+  if (output_dir.empty() && !runtime_output_dir_param_name_.empty()) {
+    ros::param::get(runtime_output_dir_param_name_, output_dir);
+  }
+  if (output_dir.empty()) {
+    return;
+  }
+  runtime_output_dir_ = output_dir;
+  if (runtime_logger_.Initialize(output_dir)) {
+    FlushPendingRuntimeRecords();
+  }
+}
+
+void DeformMonitorV3Node::FlushPendingRuntimeRecords() {
+  if (!runtime_logger_.is_initialized()) {
+    return;
+  }
+  while (!pending_runtime_records_.empty()) {
+    if (!runtime_logger_.Write(pending_runtime_records_.front())) {
+      return;
+    }
+    pending_runtime_records_.pop_front();
+  }
+}
+
+void DeformMonitorV3Node::WriteStageRuntimeRecord(const StageRuntimeRecord& record) {
+  MaybeInitializeRuntimeLog();
+  if (runtime_logger_.is_initialized()) {
+    runtime_logger_.Write(record);
+    return;
+  }
+  pending_runtime_records_.push_back(record);
+  while (pending_runtime_records_.size() > 256) {
+    pending_runtime_records_.pop_front();
+  }
+}
+
+void DeformMonitorV3Node::LoadParameters() {
+  params_.io.cloud_topic = LoadParam<std::string>(private_nh_, "io/cloud_topic", params_.io.cloud_topic);
+  params_.io.covariance_topic =
+      LoadParam<std::string>(private_nh_, "io/covariance_topic", params_.io.covariance_topic);
+  params_.io.reset_reference_topic =
+      LoadParam<std::string>(private_nh_, "io/reset_reference_topic",
+                             params_.io.reset_reference_topic);
+  params_.io.reference_frame =
+      LoadParam<std::string>(private_nh_, "io/reference_frame", params_.io.reference_frame);
+  params_.io.cloud_already_in_reference_frame =
+      LoadParam<bool>(private_nh_,
+                      "io/cloud_already_in_reference_frame",
+                      params_.io.cloud_already_in_reference_frame);
+  params_.io.odom_cov_layout =
+      LoadParam<std::string>(private_nh_, "io/odom_cov_layout", params_.io.odom_cov_layout);
+  params_.io.default_rot_sigma =
+      LoadParam<double>(private_nh_, "io/default_rot_sigma", params_.io.default_rot_sigma);
+  params_.io.default_pos_sigma =
+      LoadParam<double>(private_nh_, "io/default_pos_sigma", params_.io.default_pos_sigma);
+
+  params_.reference.init_frames =
+      LoadParam<int>(private_nh_, "deform_monitor/reference/init_frames", params_.reference.init_frames);
+  params_.reference.tau_ref_quality =
+      LoadParam<double>(private_nh_, "deform_monitor/reference/tau_ref_quality", params_.reference.tau_ref_quality);
+  params_.reference.tau_cmp_ref =
+      LoadParam<double>(private_nh_, "deform_monitor/reference/tau_cmp_ref", params_.reference.tau_cmp_ref);
+  params_.reference.tau_ref_stable =
+      LoadParam<double>(private_nh_, "deform_monitor/reference/tau_ref_stable", params_.reference.tau_ref_stable);
+  params_.reference.N_ref_stable =
+      LoadParam<int>(private_nh_, "deform_monitor/reference/N_ref_stable", params_.reference.N_ref_stable);
+  params_.reference.tau_mu0 =
+      LoadParam<double>(private_nh_, "deform_monitor/reference/tau_mu0", params_.reference.tau_mu0);
+
+  params_.runtime_scaling.anchor_keep_ratio =
+      LoadParam<double>(private_nh_, "deform_monitor/runtime_scaling/anchor_keep_ratio",
+                        params_.runtime_scaling.anchor_keep_ratio);
+  if (!(params_.runtime_scaling.anchor_keep_ratio > 0.0 &&
+        params_.runtime_scaling.anchor_keep_ratio <= 1.0)) {
+    throw std::invalid_argument(
+        "deform_monitor/runtime_scaling/anchor_keep_ratio must be in (0, 1]");
+  }
+
+  params_.covariance.alpha_xi =
+      LoadParam<double>(private_nh_, "deform_monitor/covariance/alpha_xi", params_.covariance.alpha_xi);
+  params_.covariance.sigma_p =
+      LoadParam<double>(private_nh_, "deform_monitor/covariance/sigma_p", params_.covariance.sigma_p);
+
+  params_.observation.tau_n_deg =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/tau_n_deg", params_.observation.tau_n_deg);
+  params_.observation.tau_v_deg =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/tau_v_deg", params_.observation.tau_v_deg);
+  params_.observation.tau_r_ratio =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/tau_r_ratio", params_.observation.tau_r_ratio);
+  params_.observation.tau_cmp =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/tau_cmp", params_.observation.tau_cmp);
+  params_.observation.current_voxel_size =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/current_voxel_size",
+                        params_.observation.current_voxel_size);
+  params_.observation.tau_reacquire =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/tau_reacquire",
+                        params_.observation.tau_reacquire);
+  params_.observation.reacquire_radius =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/reacquire_radius",
+                        params_.observation.reacquire_radius);
+  params_.observation.reacquire_max_innovation =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/reacquire_max_innovation",
+                        params_.observation.reacquire_max_innovation);
+  params_.observation.reacquire_innovation_scale =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/reacquire_innovation_scale",
+                        params_.observation.reacquire_innovation_scale);
+  params_.observation.max_reacquire_candidates =
+      LoadParam<int>(private_nh_, "deform_monitor/observation/max_reacquire_candidates",
+                     params_.observation.max_reacquire_candidates);
+  params_.observation.min_support_scalar =
+      LoadParam<int>(private_nh_, "deform_monitor/observation/min_support_scalar",
+                     params_.observation.min_support_scalar);
+  params_.observation.tau_nis_scalar =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/tau_nis_scalar",
+                        params_.observation.tau_nis_scalar);
+  params_.observation.edge_max_direction_deg =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/edge_max_direction_deg",
+                        params_.observation.edge_max_direction_deg);
+  params_.observation.edge_min_linearity =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/edge_min_linearity",
+                        params_.observation.edge_min_linearity);
+  params_.observation.edge_min_type_stability =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/edge_min_type_stability",
+                        params_.observation.edge_min_type_stability);
+  params_.observation.soft_view_range_gate =
+      LoadParam<bool>(private_nh_, "deform_monitor/observation/soft_view_range_gate",
+                      params_.observation.soft_view_range_gate);
+  params_.observation.hard_view_deg_cap =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/hard_view_deg_cap",
+                        params_.observation.hard_view_deg_cap);
+  params_.observation.hard_range_ratio_cap =
+      LoadParam<double>(private_nh_, "deform_monitor/observation/hard_range_ratio_cap",
+                        params_.observation.hard_range_ratio_cap);
+
+  params_.temporal.enable =
+      LoadParam<bool>(private_nh_, "deform_monitor/temporal/enable", params_.temporal.enable);
+  params_.temporal.window_frames =
+      LoadParam<int>(private_nh_, "deform_monitor/temporal/window_frames",
+                     params_.temporal.window_frames);
+  params_.temporal.min_frames =
+      LoadParam<int>(private_nh_, "deform_monitor/temporal/min_frames",
+                     params_.temporal.min_frames);
+  params_.temporal.step_frames =
+      LoadParam<int>(private_nh_, "deform_monitor/temporal/step_frames",
+                     params_.temporal.step_frames);
+  params_.temporal.max_window_sec =
+      LoadParam<double>(private_nh_, "deform_monitor/temporal/max_window_sec",
+                        params_.temporal.max_window_sec);
+  params_.temporal.pose_corr_inflation =
+      LoadParam<double>(private_nh_, "deform_monitor/temporal/pose_corr_inflation",
+                        params_.temporal.pose_corr_inflation);
+  params_.temporal.sigma_motion_per_sec =
+      LoadParam<double>(private_nh_, "deform_monitor/temporal/sigma_motion_per_sec",
+                        params_.temporal.sigma_motion_per_sec);
+  params_.temporal.use_stable_voxel_fusion =
+      LoadParam<bool>(private_nh_, "deform_monitor/temporal/use_stable_voxel_fusion",
+                      params_.temporal.use_stable_voxel_fusion);
+  params_.temporal.min_fused_visible_frames =
+      LoadParam<int>(private_nh_, "deform_monitor/temporal/min_fused_visible_frames",
+                     params_.temporal.min_fused_visible_frames);
+  params_.temporal.min_fused_points_per_voxel =
+      LoadParam<int>(private_nh_, "deform_monitor/temporal/min_fused_points_per_voxel",
+                     params_.temporal.min_fused_points_per_voxel);
+
+  params_.background_bias.enable =
+      LoadParam<bool>(private_nh_, "deform_monitor/background_bias/enable",
+                      params_.background_bias.enable);
+  params_.background_bias.min_anchor_count =
+      LoadParam<int>(private_nh_, "deform_monitor/background_bias/min_anchor_count",
+                     params_.background_bias.min_anchor_count);
+  params_.background_bias.min_scalar_count =
+      LoadParam<int>(private_nh_, "deform_monitor/background_bias/min_scalar_count",
+                     params_.background_bias.min_scalar_count);
+  params_.background_bias.min_support_points =
+      LoadParam<int>(private_nh_, "deform_monitor/background_bias/min_support_points",
+                     params_.background_bias.min_support_points);
+  params_.background_bias.min_cmp_score =
+      LoadParam<double>(private_nh_, "deform_monitor/background_bias/min_cmp_score",
+                        params_.background_bias.min_cmp_score);
+  params_.background_bias.max_anchor_disp =
+      LoadParam<double>(private_nh_, "deform_monitor/background_bias/max_anchor_disp",
+                        params_.background_bias.max_anchor_disp);
+  params_.background_bias.ridge_lambda =
+      LoadParam<double>(private_nh_, "deform_monitor/background_bias/ridge_lambda",
+                        params_.background_bias.ridge_lambda);
+  params_.background_bias.huber_delta =
+      LoadParam<double>(private_nh_, "deform_monitor/background_bias/huber_delta",
+                        params_.background_bias.huber_delta);
+  params_.background_bias.max_bias_norm =
+      LoadParam<double>(private_nh_, "deform_monitor/background_bias/max_bias_norm",
+                        params_.background_bias.max_bias_norm);
+  params_.background_bias.adaptive_disp_step1 =
+      LoadParam<double>(private_nh_, "deform_monitor/background_bias/adaptive_disp_step1",
+                        params_.background_bias.adaptive_disp_step1);
+  params_.background_bias.adaptive_disp_step2 =
+      LoadParam<double>(private_nh_, "deform_monitor/background_bias/adaptive_disp_step2",
+                        params_.background_bias.adaptive_disp_step2);
+  params_.background_bias.ema_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/background_bias/ema_alpha",
+                        params_.background_bias.ema_alpha);
+  params_.background_bias.min_stable_ratio =
+      LoadParam<double>(private_nh_, "deform_monitor/background_bias/min_stable_ratio",
+                        params_.background_bias.min_stable_ratio);
+
+  params_.local_contrast.enable =
+      LoadParam<bool>(private_nh_, "deform_monitor/local_contrast/enable",
+                      params_.local_contrast.enable);
+  params_.local_contrast.radius =
+      LoadParam<double>(private_nh_, "deform_monitor/local_contrast/radius",
+                        params_.local_contrast.radius);
+  params_.local_contrast.min_neighbors =
+      LoadParam<int>(private_nh_, "deform_monitor/local_contrast/min_neighbors",
+                     params_.local_contrast.min_neighbors);
+  params_.local_contrast.enable_plane_background_for_edges =
+      LoadParam<bool>(private_nh_,
+                      "deform_monitor/local_contrast/enable_plane_background_for_edges",
+                      params_.local_contrast.enable_plane_background_for_edges);
+  params_.local_contrast.min_plane_neighbors =
+      LoadParam<int>(private_nh_, "deform_monitor/local_contrast/min_plane_neighbors",
+                     params_.local_contrast.min_plane_neighbors);
+  params_.local_contrast.min_support_points =
+      LoadParam<int>(private_nh_, "deform_monitor/local_contrast/min_support_points",
+                     params_.local_contrast.min_support_points);
+  params_.local_contrast.min_cmp_score =
+      LoadParam<double>(private_nh_, "deform_monitor/local_contrast/min_cmp_score",
+                        params_.local_contrast.min_cmp_score);
+  params_.local_contrast.tau_bg_normal_deg =
+      LoadParam<double>(private_nh_, "deform_monitor/local_contrast/tau_bg_normal_deg",
+                        params_.local_contrast.tau_bg_normal_deg);
+  params_.local_contrast.max_background_disp =
+      LoadParam<double>(private_nh_, "deform_monitor/local_contrast/max_background_disp",
+                        params_.local_contrast.max_background_disp);
+  params_.local_contrast.min_background_sigma =
+      LoadParam<double>(private_nh_, "deform_monitor/local_contrast/min_background_sigma",
+                        params_.local_contrast.min_background_sigma);
+  params_.local_contrast.tau_rel_norm =
+      LoadParam<double>(private_nh_, "deform_monitor/local_contrast/tau_rel_norm",
+                        params_.local_contrast.tau_rel_norm);
+  params_.local_contrast.tau_rel_normal =
+      LoadParam<double>(private_nh_, "deform_monitor/local_contrast/tau_rel_normal",
+                        params_.local_contrast.tau_rel_normal);
+  params_.local_contrast.tau_rel_edge =
+      LoadParam<double>(private_nh_, "deform_monitor/local_contrast/tau_rel_edge",
+                        params_.local_contrast.tau_rel_edge);
+  params_.local_contrast.tau_contrast_score =
+      LoadParam<double>(private_nh_, "deform_monitor/local_contrast/tau_contrast_score",
+                        params_.local_contrast.tau_contrast_score);
+  params_.local_contrast.tau_plane_contrast_score =
+      LoadParam<double>(private_nh_, "deform_monitor/local_contrast/tau_plane_contrast_score",
+                        params_.local_contrast.tau_plane_contrast_score);
+
+  params_.graph_temporal.enable =
+      LoadParam<bool>(private_nh_, "deform_monitor/graph_temporal/enable",
+                      params_.graph_temporal.enable);
+  params_.graph_temporal.spatial_hash_size =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/spatial_hash_size",
+                        params_.graph_temporal.spatial_hash_size);
+  params_.graph_temporal.radius =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/radius",
+                        params_.graph_temporal.radius);
+  params_.graph_temporal.min_neighbors =
+      LoadParam<int>(private_nh_, "deform_monitor/graph_temporal/min_neighbors",
+                     params_.graph_temporal.min_neighbors);
+  params_.graph_temporal.tau_normal_deg =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/tau_normal_deg",
+                        params_.graph_temporal.tau_normal_deg);
+  params_.graph_temporal.tau_disp_cos =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/tau_disp_cos",
+                        params_.graph_temporal.tau_disp_cos);
+  params_.graph_temporal.tau_coherent_diff =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/tau_coherent_diff",
+                        params_.graph_temporal.tau_coherent_diff);
+  params_.graph_temporal.tau_temporal_change =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/tau_temporal_change",
+                        params_.graph_temporal.tau_temporal_change);
+  params_.graph_temporal.min_anchor_disp =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/min_anchor_disp",
+                        params_.graph_temporal.min_anchor_disp);
+  params_.graph_temporal.ema_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/ema_alpha",
+                        params_.graph_temporal.ema_alpha);
+  params_.graph_temporal.cusum_k =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/cusum_k",
+                        params_.graph_temporal.cusum_k);
+  params_.graph_temporal.cusum_h =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/cusum_h",
+                        params_.graph_temporal.cusum_h);
+  
+  params_.graph_temporal.cusum_lambda =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/cusum_lambda",
+                        params_.graph_temporal.cusum_lambda);
+  params_.graph_temporal.tau_graph_support =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/tau_graph_support",
+                        params_.graph_temporal.tau_graph_support);
+  params_.graph_temporal.tau_graph_temporal =
+      LoadParam<double>(private_nh_, "deform_monitor/graph_temporal/tau_graph_temporal",
+                        params_.graph_temporal.tau_graph_temporal);
+  if (params_.graph_temporal.spatial_hash_size <= 0.0) {
+    params_.graph_temporal.spatial_hash_size = params_.anchor.voxel_size;
+  }
+
+  params_.weak_plane_motion.enable =
+      LoadParam<bool>(private_nh_, "deform_monitor/weak_plane_motion/enable",
+                      params_.weak_plane_motion.enable);
+  params_.weak_plane_motion.enable_mixed_types =
+      LoadParam<bool>(private_nh_, "deform_monitor/weak_plane_motion/enable_mixed_types",
+                      params_.weak_plane_motion.enable_mixed_types);
+  params_.weak_plane_motion.require_exterior_background_for_non_plane =
+      LoadParam<bool>(
+          private_nh_,
+          "deform_monitor/weak_plane_motion/require_exterior_background_for_non_plane",
+          params_.weak_plane_motion.require_exterior_background_for_non_plane);
+  params_.weak_plane_motion.radius =
+      LoadParam<double>(private_nh_, "deform_monitor/weak_plane_motion/radius",
+                        params_.weak_plane_motion.radius);
+  params_.weak_plane_motion.component_match_radius =
+      LoadParam<double>(private_nh_,
+                        "deform_monitor/weak_plane_motion/component_match_radius",
+                        params_.weak_plane_motion.component_match_radius);
+  params_.weak_plane_motion.min_support =
+      LoadParam<int>(private_nh_, "deform_monitor/weak_plane_motion/min_support",
+                     params_.weak_plane_motion.min_support);
+  params_.weak_plane_motion.temporal_window_frames =
+      LoadParam<int>(private_nh_, "deform_monitor/weak_plane_motion/temporal_window_frames",
+                     params_.weak_plane_motion.temporal_window_frames);
+  params_.weak_plane_motion.min_current_support =
+      LoadParam<int>(private_nh_, "deform_monitor/weak_plane_motion/min_current_support",
+                     params_.weak_plane_motion.min_current_support);
+  params_.weak_plane_motion.min_temporal_frames =
+      LoadParam<int>(private_nh_, "deform_monitor/weak_plane_motion/min_temporal_frames",
+                     params_.weak_plane_motion.min_temporal_frames);
+  params_.weak_plane_motion.min_streak =
+      LoadParam<int>(private_nh_, "deform_monitor/weak_plane_motion/min_streak",
+                     params_.weak_plane_motion.min_streak);
+  params_.weak_plane_motion.min_exterior_background_support =
+      LoadParam<int>(
+          private_nh_,
+          "deform_monitor/weak_plane_motion/min_exterior_background_support",
+          params_.weak_plane_motion.min_exterior_background_support);
+  params_.weak_plane_motion.component_max_missed_frames =
+      LoadParam<int>(private_nh_,
+                     "deform_monitor/weak_plane_motion/component_max_missed_frames",
+                     params_.weak_plane_motion.component_max_missed_frames);
+  params_.weak_plane_motion.min_ref_quality =
+      LoadParam<double>(private_nh_, "deform_monitor/weak_plane_motion/min_ref_quality",
+                        params_.weak_plane_motion.min_ref_quality);
+  params_.weak_plane_motion.min_covariance_quality =
+      LoadParam<double>(private_nh_, "deform_monitor/weak_plane_motion/min_covariance_quality",
+                        params_.weak_plane_motion.min_covariance_quality);
+  params_.weak_plane_motion.min_type_stability =
+      LoadParam<double>(private_nh_, "deform_monitor/weak_plane_motion/min_type_stability",
+                        params_.weak_plane_motion.min_type_stability);
+  params_.weak_plane_motion.min_anchor_disp =
+      LoadParam<double>(private_nh_, "deform_monitor/weak_plane_motion/min_anchor_disp",
+                        params_.weak_plane_motion.min_anchor_disp);
+  params_.weak_plane_motion.min_group_disp =
+      LoadParam<double>(private_nh_, "deform_monitor/weak_plane_motion/min_group_disp",
+                        params_.weak_plane_motion.min_group_disp);
+  params_.weak_plane_motion.min_mean_chi2 =
+      LoadParam<double>(private_nh_, "deform_monitor/weak_plane_motion/min_mean_chi2",
+                        params_.weak_plane_motion.min_mean_chi2);
+  params_.weak_plane_motion.min_direction_consistency =
+      LoadParam<double>(private_nh_, "deform_monitor/weak_plane_motion/min_direction_consistency",
+                        params_.weak_plane_motion.min_direction_consistency);
+  params_.weak_plane_motion.component_match_direction_cos =
+      LoadParam<double>(
+          private_nh_,
+          "deform_monitor/weak_plane_motion/component_match_direction_cos",
+          params_.weak_plane_motion.component_match_direction_cos);
+  params_.weak_plane_motion.max_normal_deg =
+      LoadParam<double>(private_nh_, "deform_monitor/weak_plane_motion/max_normal_deg",
+                        params_.weak_plane_motion.max_normal_deg);
+  params_.weak_plane_motion.max_group_residual =
+      LoadParam<double>(private_nh_, "deform_monitor/weak_plane_motion/max_group_residual",
+                        params_.weak_plane_motion.max_group_residual);
+  params_.weak_plane_motion.streak_decay =
+      LoadParam<int>(private_nh_, "deform_monitor/weak_plane_motion/streak_decay",
+                     params_.weak_plane_motion.streak_decay);
+
+  params_.anchor.I_min =
+      LoadParam<double>(private_nh_, "deform_monitor/anchor/I_min", params_.anchor.I_min);
+  params_.anchor.beta_edge =
+      LoadParam<double>(private_nh_, "deform_monitor/anchor/beta_edge", params_.anchor.beta_edge);
+  params_.anchor.beta_depth =
+      LoadParam<double>(private_nh_, "deform_monitor/anchor/beta_depth", params_.anchor.beta_depth);
+  params_.anchor.beta_normal =
+      LoadParam<double>(private_nh_, "deform_monitor/anchor/beta_normal", params_.anchor.beta_normal);
+  params_.anchor.beta_view =
+      LoadParam<double>(private_nh_, "deform_monitor/anchor/beta_view", params_.anchor.beta_view);
+  params_.anchor.voxel_size =
+      LoadParam<double>(private_nh_, "deform_monitor/anchor/voxel_size", params_.anchor.voxel_size);
+  params_.anchor.min_visible_frames =
+      LoadParam<int>(private_nh_, "deform_monitor/anchor/min_visible_frames",
+                     params_.anchor.min_visible_frames);
+  params_.anchor.min_points_per_voxel =
+      LoadParam<int>(private_nh_, "deform_monitor/anchor/min_points_per_voxel",
+                     params_.anchor.min_points_per_voxel);
+  params_.anchor.neighborhood_layers =
+      LoadParam<int>(private_nh_, "deform_monitor/anchor/neighborhood_layers",
+                     params_.anchor.neighborhood_layers);
+  params_.anchor.seed_voxel =
+      LoadParam<double>(private_nh_, "deform_monitor/anchor/seed_voxel", params_.anchor.seed_voxel);
+  params_.anchor.radius_min =
+      LoadParam<double>(private_nh_, "deform_monitor/anchor/radius_min", params_.anchor.radius_min);
+  params_.anchor.min_support_points =
+      LoadParam<int>(private_nh_, "deform_monitor/anchor/min_support_points",
+                     params_.anchor.min_support_points);
+  params_.anchor.edge_ref_bonus =
+      LoadParam<double>(private_nh_, "deform_monitor/anchor/edge_ref_bonus",
+                        params_.anchor.edge_ref_bonus);
+  params_.anchor.band_ref_bonus =
+      LoadParam<double>(private_nh_, "deform_monitor/anchor/band_ref_bonus",
+                        params_.anchor.band_ref_bonus);
+  params_.anchor.tau_ref_quality = params_.reference.tau_ref_quality;
+
+  params_.object_association.enable =
+      LoadParam<bool>(private_nh_, "deform_monitor/object_association/enable",
+                      params_.object_association.enable);
+  const int invalid_object_id =
+      LoadParam<int>(private_nh_, "deform_monitor/object_association/invalid_id",
+                     static_cast<int>(params_.object_association.invalid_id));
+  const int max_object_id =
+      LoadParam<int>(private_nh_, "deform_monitor/object_association/max_id",
+                     static_cast<int>(params_.object_association.max_id));
+  params_.object_association.invalid_id = static_cast<uint16_t>(
+      std::max(0, std::min(65535, invalid_object_id)));
+  params_.object_association.max_id = static_cast<uint16_t>(
+      std::max(0, std::min(65535, max_object_id)));
+  params_.object_association.min_support_points =
+      LoadParam<int>(private_nh_, "deform_monitor/object_association/min_support_points",
+                     params_.object_association.min_support_points);
+  params_.object_association.min_purity =
+      LoadParam<double>(private_nh_, "deform_monitor/object_association/min_purity",
+                        params_.object_association.min_purity);
+  params_.object_association.quantization_tolerance =
+      LoadParam<double>(private_nh_, "deform_monitor/object_association/quantization_tolerance",
+                        params_.object_association.quantization_tolerance);
+
+  params_.noise.sigma_pi0 =
+      LoadParam<double>(private_nh_, "deform_monitor/noise/sigma_pi0", params_.noise.sigma_pi0);
+  params_.noise.sigma_edge0 =
+      LoadParam<double>(private_nh_, "deform_monitor/noise/sigma_edge0", params_.noise.sigma_edge0);
+  params_.noise.sigma_rad0 =
+      LoadParam<double>(private_nh_, "deform_monitor/noise/sigma_rad0", params_.noise.sigma_rad0);
+  params_.noise.sigma_bc0 =
+      LoadParam<double>(private_nh_, "deform_monitor/noise/sigma_bc0", params_.noise.sigma_bc0);
+  params_.noise.kappa_r =
+      LoadParam<double>(private_nh_, "deform_monitor/noise/kappa_r", params_.noise.kappa_r);
+  params_.noise.kappa_v =
+      LoadParam<double>(private_nh_, "deform_monitor/noise/kappa_v", params_.noise.kappa_v);
+
+  params_.observability.tau_lambda =
+      LoadParam<double>(private_nh_, "deform_monitor/observability/tau_lambda",
+                        params_.observability.tau_lambda);
+  params_.observability.tau_sigma_max =
+      LoadParam<double>(private_nh_, "deform_monitor/observability/tau_sigma_max",
+                        params_.observability.tau_sigma_max);
+
+  params_.imm.rho = LoadParam<double>(private_nh_, "deform_monitor/imm/rho", params_.imm.rho);
+  params_.imm.enable_model_competition =
+      LoadParam<bool>(private_nh_,
+                      "deform_monitor/imm/enable_model_competition",
+                      params_.imm.enable_model_competition);
+  params_.imm.enable_type_constraint =
+      LoadParam<bool>(private_nh_,
+                      "deform_monitor/imm/enable_type_constraint",
+                      params_.imm.enable_type_constraint);
+  params_.imm.p00 = LoadParam<double>(private_nh_, "deform_monitor/imm/p00", params_.imm.p00);
+  params_.imm.p01 = LoadParam<double>(private_nh_, "deform_monitor/imm/p01", params_.imm.p01);
+  params_.imm.p10 = LoadParam<double>(private_nh_, "deform_monitor/imm/p10", params_.imm.p10);
+  params_.imm.p11 = LoadParam<double>(private_nh_, "deform_monitor/imm/p11", params_.imm.p11);
+  params_.imm.q_u0 = LoadParam<double>(private_nh_, "deform_monitor/imm/q_u0", params_.imm.q_u0);
+  params_.imm.q_v0 = LoadParam<double>(private_nh_, "deform_monitor/imm/q_v0", params_.imm.q_v0);
+  params_.imm.q_u1 = LoadParam<double>(private_nh_, "deform_monitor/imm/q_u1", params_.imm.q_u1);
+  params_.imm.q_v1 = LoadParam<double>(private_nh_, "deform_monitor/imm/q_v1", params_.imm.q_v1);
+
+  params_.significance.alpha_s =
+      LoadParam<double>(private_nh_, "deform_monitor/significance/alpha_s", params_.significance.alpha_s);
+  params_.significance.enable_cusum =
+      LoadParam<bool>(private_nh_,
+                      "deform_monitor/significance/enable_cusum",
+                      params_.significance.enable_cusum);
+  params_.significance.tau_A_norm =
+      LoadParam<double>(private_nh_, "deform_monitor/significance/tau_A_norm", params_.significance.tau_A_norm);
+  params_.significance.tau_A_normal =
+      LoadParam<double>(private_nh_, "deform_monitor/significance/tau_A_normal",
+                        params_.significance.tau_A_normal);
+  params_.significance.tau_A_edge =
+      LoadParam<double>(private_nh_, "deform_monitor/significance/tau_A_edge", params_.significance.tau_A_edge);
+  params_.significance.tau_disappear =
+      LoadParam<double>(private_nh_, "deform_monitor/significance/tau_disappear",
+                        params_.significance.tau_disappear);
+  params_.significance.disappear_frames =
+      LoadParam<int>(private_nh_, "deform_monitor/significance/disappear_frames",
+                     params_.significance.disappear_frames);
+  params_.significance.cusum_k =
+      LoadParam<double>(private_nh_, "deform_monitor/significance/cusum_k", params_.significance.cusum_k);
+  params_.significance.cusum_h =
+      LoadParam<double>(private_nh_, "deform_monitor/significance/cusum_h", params_.significance.cusum_h);
+  
+  params_.significance.cusum_lambda =
+      LoadParam<double>(private_nh_, "deform_monitor/significance/cusum_lambda", params_.significance.cusum_lambda);
+  params_.significance.cusum_cap_factor =
+      LoadParam<double>(private_nh_, "deform_monitor/significance/cusum_cap_factor", params_.significance.cusum_cap_factor);
+
+  params_.directional_motion.lambda0 =
+      LoadParam<double>(private_nh_, "deform_monitor/directional_motion/lambda0",
+                        params_.directional_motion.lambda0);
+  params_.directional_motion.enable =
+      LoadParam<bool>(private_nh_,
+                      "deform_monitor/directional_motion/enable",
+                      params_.directional_motion.enable);
+  params_.directional_motion.tau_s =
+      LoadParam<double>(private_nh_, "deform_monitor/directional_motion/tau_s",
+                        params_.directional_motion.tau_s);
+  params_.directional_motion.tau_c =
+      LoadParam<double>(private_nh_, "deform_monitor/directional_motion/tau_c",
+                        params_.directional_motion.tau_c);
+  params_.directional_motion.tau_d =
+      LoadParam<double>(private_nh_, "deform_monitor/directional_motion/tau_d",
+                        params_.directional_motion.tau_d);
+  params_.directional_motion.epsilon =
+      LoadParam<double>(private_nh_, "deform_monitor/directional_motion/epsilon",
+                        params_.directional_motion.epsilon);
+
+  params_.cluster.tau_d =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/tau_d", params_.cluster.tau_d);
+  params_.cluster.tau_ng_deg =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/tau_ng_deg", params_.cluster.tau_ng_deg);
+  params_.cluster.tau_u_cos =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/tau_u_cos", params_.cluster.tau_u_cos);
+  params_.cluster.tau_corr =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/tau_corr", params_.cluster.tau_corr);
+  params_.cluster.enable_compact_motion =
+      LoadParam<bool>(private_nh_, "deform_monitor/cluster/enable_compact_motion",
+                      params_.cluster.enable_compact_motion);
+  params_.cluster.compact_tau_d =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/compact_tau_d",
+                        params_.cluster.compact_tau_d);
+  params_.cluster.compact_tau_ng_deg =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/compact_tau_ng_deg",
+                        params_.cluster.compact_tau_ng_deg);
+  params_.cluster.compact_tau_u_cos =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/compact_tau_u_cos",
+                        params_.cluster.compact_tau_u_cos);
+  params_.cluster.compact_tau_corr =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/compact_tau_corr",
+                        params_.cluster.compact_tau_corr);
+  params_.cluster.compact_seed_disp =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/compact_seed_disp",
+                        params_.cluster.compact_seed_disp);
+  params_.cluster.compact_seed_chi2 =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/compact_seed_chi2",
+                        params_.cluster.compact_seed_chi2);
+  params_.cluster.compact_min_cluster_size =
+      LoadParam<int>(private_nh_, "deform_monitor/cluster/compact_min_cluster_size",
+                     params_.cluster.compact_min_cluster_size);
+  params_.cluster.compact_tau_cluster_disp =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/compact_tau_cluster_disp",
+                        params_.cluster.compact_tau_cluster_disp);
+  params_.cluster.compact_tau_cluster_chi2 =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/compact_tau_cluster_chi2",
+                        params_.cluster.compact_tau_cluster_chi2);
+  params_.cluster.compact_max_bbox_diag =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/compact_max_bbox_diag",
+                        params_.cluster.compact_max_bbox_diag);
+  params_.cluster.spatial_hash_size =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/spatial_hash_size",
+                        params_.cluster.spatial_hash_size);
+  params_.cluster.beta_dir =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/beta_dir", params_.cluster.beta_dir);
+  params_.cluster.beta_mag =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/beta_mag", params_.cluster.beta_mag);
+  params_.cluster.beta_dist =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/beta_dist", params_.cluster.beta_dist);
+  params_.cluster.beta_time =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/beta_time", params_.cluster.beta_time);
+  params_.cluster.sigma_m =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/sigma_m", params_.cluster.sigma_m);
+  params_.cluster.sigma_d =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/sigma_d", params_.cluster.sigma_d);
+  params_.cluster.tau_edge_score =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/tau_edge_score", params_.cluster.tau_edge_score);
+  params_.cluster.min_cluster_size =
+      LoadParam<int>(private_nh_, "deform_monitor/cluster/min_cluster_size",
+                     params_.cluster.min_cluster_size);
+  params_.cluster.min_cluster_size_disappear =
+      LoadParam<int>(private_nh_, "deform_monitor/cluster/min_cluster_size_disappear",
+                     params_.cluster.min_cluster_size_disappear);
+  params_.cluster.tau_cluster_disp =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/tau_cluster_disp",
+                        params_.cluster.tau_cluster_disp);
+  params_.cluster.tau_cluster_chi2 =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/tau_cluster_chi2",
+                        params_.cluster.tau_cluster_chi2);
+  params_.cluster.tau_cluster_disappear =
+      LoadParam<double>(private_nh_, "deform_monitor/cluster/tau_cluster_disappear",
+                        params_.cluster.tau_cluster_disappear);
+
+  params_.structure_correspondence.enable =
+      LoadParam<bool>(private_nh_, "deform_monitor/structure_correspondence/enable",
+                      params_.structure_correspondence.enable);
+  params_.structure_correspondence.publish_motions =
+      LoadParam<bool>(private_nh_, "deform_monitor/structure_correspondence/publish_motions",
+                      params_.structure_correspondence.publish_motions);
+  params_.structure_correspondence.publish_markers =
+      LoadParam<bool>(private_nh_, "deform_monitor/structure_correspondence/publish_markers",
+                      params_.structure_correspondence.publish_markers);
+  params_.structure_correspondence.old_min_anchor_count =
+      LoadParam<int>(private_nh_, "deform_monitor/structure_correspondence/old_min_anchor_count",
+                     params_.structure_correspondence.old_min_anchor_count);
+  params_.structure_correspondence.new_min_anchor_count =
+      LoadParam<int>(private_nh_, "deform_monitor/structure_correspondence/new_min_anchor_count",
+                     params_.structure_correspondence.new_min_anchor_count);
+  params_.structure_correspondence.max_match_distance =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/max_match_distance",
+                        params_.structure_correspondence.max_match_distance);
+  params_.structure_correspondence.max_size_gap =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/max_size_gap",
+                        params_.structure_correspondence.max_size_gap);
+  params_.structure_correspondence.max_normal_deg =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/max_normal_deg",
+                        params_.structure_correspondence.max_normal_deg);
+  params_.structure_correspondence.max_type_l1 =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/max_type_l1",
+                        params_.structure_correspondence.max_type_l1);
+  params_.structure_correspondence.max_match_cost =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/max_match_cost",
+                        params_.structure_correspondence.max_match_cost);
+  params_.structure_correspondence.min_confidence =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/min_confidence",
+                        params_.structure_correspondence.min_confidence);
+  params_.structure_correspondence.min_motion_distance =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/min_motion_distance",
+                        params_.structure_correspondence.min_motion_distance);
+  params_.structure_correspondence.weight_dist =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/weight_dist",
+                        params_.structure_correspondence.weight_dist);
+  params_.structure_correspondence.weight_size =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/weight_size",
+                        params_.structure_correspondence.weight_size);
+  params_.structure_correspondence.weight_normal =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/weight_normal",
+                        params_.structure_correspondence.weight_normal);
+  params_.structure_correspondence.weight_type =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/weight_type",
+                        params_.structure_correspondence.weight_type);
+  params_.structure_correspondence.weight_motion =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/weight_motion",
+                        params_.structure_correspondence.weight_motion);
+  params_.structure_correspondence.weight_persistence =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/weight_persistence",
+                        params_.structure_correspondence.weight_persistence);
+  params_.structure_correspondence.old_score_threshold =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/old_score_threshold",
+                        params_.structure_correspondence.old_score_threshold);
+  params_.structure_correspondence.new_disp_threshold =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/new_disp_threshold",
+                        params_.structure_correspondence.new_disp_threshold);
+  params_.structure_correspondence.marker_arrow_scale =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/marker_arrow_scale",
+                        params_.structure_correspondence.marker_arrow_scale);
+  params_.structure_correspondence.marker_outline_width =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/marker_outline_width",
+                        params_.structure_correspondence.marker_outline_width);
+  params_.structure_correspondence.marker_old_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/marker_old_alpha",
+                        params_.structure_correspondence.marker_old_alpha);
+  params_.structure_correspondence.marker_new_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/marker_new_alpha",
+                        params_.structure_correspondence.marker_new_alpha);
+  params_.structure_correspondence.marker_arrow_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/structure_correspondence/marker_arrow_alpha",
+                        params_.structure_correspondence.marker_arrow_alpha);
+  if (params_.cluster.spatial_hash_size <= 0.0) {
+    params_.cluster.spatial_hash_size = params_.anchor.voxel_size;
+  }
+  params_.visualization.show_cluster_text =
+      LoadParam<bool>(private_nh_, "deform_monitor/visualization/show_cluster_text",
+                      params_.visualization.show_cluster_text);
+  params_.visualization.show_all_anchors =
+      LoadParam<bool>(private_nh_, "deform_monitor/visualization/show_all_anchors",
+                      params_.visualization.show_all_anchors);
+  params_.visualization.show_comparable_anchors =
+      LoadParam<bool>(private_nh_, "deform_monitor/visualization/show_comparable_anchors",
+                      params_.visualization.show_comparable_anchors);
+  params_.visualization.show_cluster_boxes =
+      LoadParam<bool>(private_nh_, "deform_monitor/visualization/show_cluster_boxes",
+                      params_.visualization.show_cluster_boxes);
+  params_.visualization.show_detected_object_boxes =
+      LoadParam<bool>(private_nh_, "deform_monitor/visualization/show_detected_object_boxes",
+                      params_.visualization.show_detected_object_boxes);
+  params_.visualization.text_only_significant =
+      LoadParam<bool>(private_nh_, "deform_monitor/visualization/text_only_significant",
+                      params_.visualization.text_only_significant);
+  params_.visualization.arrows_only_clustered_or_reacquired =
+      LoadParam<bool>(private_nh_, "deform_monitor/visualization/arrows_only_clustered_or_reacquired",
+                      params_.visualization.arrows_only_clustered_or_reacquired);
+  params_.visualization.min_arrow_disp =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/min_arrow_disp",
+                        params_.visualization.min_arrow_disp);
+  params_.visualization.weak_plane_min_arrow_disp =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/weak_plane_min_arrow_disp",
+                        params_.visualization.weak_plane_min_arrow_disp);
+  params_.visualization.min_arrow_contrast_score =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/min_arrow_contrast_score",
+                        params_.visualization.min_arrow_contrast_score);
+  params_.visualization.max_arrow_disp =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/max_arrow_disp",
+                        params_.visualization.max_arrow_disp);
+  params_.visualization.arrow_disp_scale =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/arrow_disp_scale",
+                        params_.visualization.arrow_disp_scale);
+  params_.visualization.arrow_shaft_diameter =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/arrow_shaft_diameter",
+                        params_.visualization.arrow_shaft_diameter);
+  params_.visualization.arrow_head_diameter =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/arrow_head_diameter",
+                        params_.visualization.arrow_head_diameter);
+  params_.visualization.arrow_head_length =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/arrow_head_length",
+                        params_.visualization.arrow_head_length);
+  params_.visualization.cluster_box_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/cluster_box_alpha",
+                        params_.visualization.cluster_box_alpha);
+  params_.visualization.cluster_outline_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/cluster_outline_alpha",
+                        params_.visualization.cluster_outline_alpha);
+  params_.visualization.cluster_outline_width =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/cluster_outline_width",
+                        params_.visualization.cluster_outline_width);
+  params_.visualization.cluster_min_box_size =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/cluster_min_box_size",
+                        params_.visualization.cluster_min_box_size);
+  params_.visualization.detected_object_box_margin =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/detected_object_box_margin",
+                        params_.visualization.detected_object_box_margin);
+  params_.visualization.detected_object_box_min_size =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/detected_object_box_min_size",
+                        params_.visualization.detected_object_box_min_size);
+  params_.visualization.detected_object_box_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/visualization/detected_object_box_alpha",
+                        params_.visualization.detected_object_box_alpha);
+  params_.risk_visualization.enable =
+      LoadParam<bool>(private_nh_, "deform_monitor/risk_visualization/enable",
+                      params_.risk_visualization.enable);
+  params_.risk_visualization.publish_evidence =
+      LoadParam<bool>(private_nh_, "deform_monitor/risk_visualization/publish_evidence",
+                      params_.risk_visualization.publish_evidence);
+  params_.risk_visualization.publish_voxels =
+      LoadParam<bool>(private_nh_, "deform_monitor/risk_visualization/publish_voxels",
+                      params_.risk_visualization.publish_voxels);
+  params_.risk_visualization.publish_regions =
+      LoadParam<bool>(private_nh_, "deform_monitor/risk_visualization/publish_regions",
+                      params_.risk_visualization.publish_regions);
+  params_.risk_visualization.publish_markers =
+      LoadParam<bool>(private_nh_, "deform_monitor/risk_visualization/publish_markers",
+                      params_.risk_visualization.publish_markers);
+  params_.risk_visualization.voxel_size =
+      LoadParam<double>(private_nh_, "deform_monitor/risk_visualization/voxel_size",
+                        params_.risk_visualization.voxel_size);
+  params_.risk_visualization.kernel_sigma =
+      LoadParam<double>(private_nh_, "deform_monitor/risk_visualization/kernel_sigma",
+                        params_.risk_visualization.kernel_sigma);
+  params_.risk_visualization.kernel_radius =
+      LoadParam<double>(private_nh_, "deform_monitor/risk_visualization/kernel_radius",
+                        params_.risk_visualization.kernel_radius);
+  params_.risk_visualization.min_confidence =
+      LoadParam<double>(private_nh_, "deform_monitor/risk_visualization/min_confidence",
+                        params_.risk_visualization.min_confidence);
+  params_.risk_visualization.min_graph_neighbors =
+      LoadParam<int>(private_nh_, "deform_monitor/risk_visualization/min_graph_neighbors",
+                     params_.risk_visualization.min_graph_neighbors);
+  params_.risk_visualization.min_risk_score =
+      LoadParam<double>(private_nh_, "deform_monitor/risk_visualization/min_risk_score",
+                        params_.risk_visualization.min_risk_score);
+  params_.risk_visualization.min_voxel_risk =
+      LoadParam<double>(private_nh_, "deform_monitor/risk_visualization/min_voxel_risk",
+                        params_.risk_visualization.min_voxel_risk);
+  params_.risk_visualization.min_region_voxels =
+      LoadParam<int>(private_nh_, "deform_monitor/risk_visualization/min_region_voxels",
+                     params_.risk_visualization.min_region_voxels);
+  params_.risk_visualization.min_region_mean_risk =
+      LoadParam<double>(private_nh_, "deform_monitor/risk_visualization/min_region_mean_risk",
+                        params_.risk_visualization.min_region_mean_risk);
+  params_.risk_visualization.low_risk_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/risk_visualization/low_risk_alpha",
+                        params_.risk_visualization.low_risk_alpha);
+  params_.risk_visualization.high_risk_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/risk_visualization/high_risk_alpha",
+                        params_.risk_visualization.high_risk_alpha);
+  params_.risk_visualization.region_outline_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/risk_visualization/region_outline_alpha",
+                        params_.risk_visualization.region_outline_alpha);
+  params_.risk_visualization.region_outline_width =
+      LoadParam<double>(private_nh_, "deform_monitor/risk_visualization/region_outline_width",
+                        params_.risk_visualization.region_outline_width);
+
+  params_.persistent_risk.enable =
+      LoadParam<bool>(private_nh_, "deform_monitor/persistent_risk/enable",
+                      params_.persistent_risk.enable);
+  params_.persistent_risk.max_center_distance =
+      LoadParam<double>(private_nh_, "deform_monitor/persistent_risk/max_center_distance",
+                        params_.persistent_risk.max_center_distance);
+  params_.persistent_risk.min_bbox_iou =
+      LoadParam<double>(private_nh_, "deform_monitor/persistent_risk/min_bbox_iou",
+                        params_.persistent_risk.min_bbox_iou);
+  params_.persistent_risk.max_risk_gap =
+      LoadParam<double>(private_nh_, "deform_monitor/persistent_risk/max_risk_gap",
+                        params_.persistent_risk.max_risk_gap);
+  params_.persistent_risk.ema_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/persistent_risk/ema_alpha",
+                        params_.persistent_risk.ema_alpha);
+  params_.persistent_risk.window_size =
+      LoadParam<int>(private_nh_, "deform_monitor/persistent_risk/window_size",
+                     params_.persistent_risk.window_size);
+  params_.persistent_risk.min_hits_to_confirm =
+      LoadParam<int>(private_nh_, "deform_monitor/persistent_risk/min_hits_to_confirm",
+                     params_.persistent_risk.min_hits_to_confirm);
+  params_.persistent_risk.min_hit_streak_to_confirm =
+      LoadParam<int>(private_nh_, "deform_monitor/persistent_risk/min_hit_streak_to_confirm",
+                     params_.persistent_risk.min_hit_streak_to_confirm);
+  params_.persistent_risk.enable_identity_backed_intermittent_confirmation =
+      LoadParam<bool>(
+          private_nh_,
+          "deform_monitor/persistent_risk/enable_identity_backed_intermittent_confirmation",
+          params_.persistent_risk.enable_identity_backed_intermittent_confirmation);
+  params_.persistent_risk.intermittent_min_hits_to_confirm =
+      LoadParam<int>(private_nh_,
+                     "deform_monitor/persistent_risk/intermittent_min_hits_to_confirm",
+                     params_.persistent_risk.intermittent_min_hits_to_confirm);
+  params_.persistent_risk.min_identity_confidence =
+      LoadParam<double>(private_nh_,
+                        "deform_monitor/persistent_risk/min_identity_confidence",
+                        params_.persistent_risk.min_identity_confidence);
+  params_.persistent_risk.identity_reconnect_distance_scale =
+      LoadParam<double>(private_nh_,
+                        "deform_monitor/persistent_risk/identity_reconnect_distance_scale",
+                        params_.persistent_risk.identity_reconnect_distance_scale);
+  params_.persistent_risk.min_confirmed_mean_risk =
+      LoadParam<double>(private_nh_, "deform_monitor/persistent_risk/min_confirmed_mean_risk",
+                        params_.persistent_risk.min_confirmed_mean_risk);
+  params_.persistent_risk.min_confirmed_confidence =
+      LoadParam<double>(private_nh_, "deform_monitor/persistent_risk/min_confirmed_confidence",
+                        params_.persistent_risk.min_confirmed_confidence);
+  params_.persistent_risk.min_confirmed_support_mass =
+      LoadParam<double>(private_nh_, "deform_monitor/persistent_risk/min_confirmed_support_mass",
+                        params_.persistent_risk.min_confirmed_support_mass);
+  params_.persistent_risk.min_confirmed_span =
+      LoadParam<double>(private_nh_, "deform_monitor/persistent_risk/min_confirmed_span",
+                        params_.persistent_risk.min_confirmed_span);
+  params_.persistent_risk.miss_frames_to_fading =
+      LoadParam<int>(private_nh_, "deform_monitor/persistent_risk/miss_frames_to_fading",
+                     params_.persistent_risk.miss_frames_to_fading);
+  params_.persistent_risk.miss_frames_to_delete =
+      LoadParam<int>(private_nh_, "deform_monitor/persistent_risk/miss_frames_to_delete",
+                     params_.persistent_risk.miss_frames_to_delete);
+  params_.persistent_risk.candidate_identity_memory_frames =
+      LoadParam<int>(private_nh_,
+                     "deform_monitor/persistent_risk/candidate_identity_memory_frames",
+                     params_.persistent_risk.candidate_identity_memory_frames);
+  params_.persistent_risk.max_prediction_sec =
+      LoadParam<double>(private_nh_, "deform_monitor/persistent_risk/max_prediction_sec",
+                        params_.persistent_risk.max_prediction_sec);
+  params_.persistent_risk.velocity_ema_alpha =
+      LoadParam<double>(private_nh_, "deform_monitor/persistent_risk/velocity_ema_alpha",
+                        params_.persistent_risk.velocity_ema_alpha);
+  params_.persistent_risk.fading_risk_floor =
+      LoadParam<double>(private_nh_, "deform_monitor/persistent_risk/fading_risk_floor",
+                        params_.persistent_risk.fading_risk_floor);
+  params_.persistent_risk.allow_sparse_planar_regions =
+      LoadParam<bool>(private_nh_, "deform_monitor/persistent_risk/allow_sparse_planar_regions",
+                      params_.persistent_risk.allow_sparse_planar_regions);
+
+  params_.structure_unit.region_spatial_hash =
+      LoadParam<double>(private_nh_, "structure_unit/region_spatial_hash",
+                        params_.structure_unit.region_spatial_hash);
+  params_.structure_unit.region_radius =
+      LoadParam<double>(private_nh_, "structure_unit/region_radius",
+                        params_.structure_unit.region_radius);
+  params_.structure_unit.region_normal_deg =
+      LoadParam<double>(private_nh_, "structure_unit/region_normal_deg",
+                        params_.structure_unit.region_normal_deg);
+  params_.structure_unit.region_edge_dir_deg =
+      LoadParam<double>(private_nh_, "structure_unit/region_edge_dir_deg",
+                        params_.structure_unit.region_edge_dir_deg);
+  params_.structure_unit.region_min_members =
+      LoadParam<int>(private_nh_, "structure_unit/region_min_members",
+                     params_.structure_unit.region_min_members);
+
+  params_.structure_tracker.enable =
+      LoadParam<bool>(private_nh_, "structure_tracker/enable",
+                       params_.structure_tracker.enable);
+  params_.structure_tracker.tau_exit =
+      LoadParam<double>(private_nh_, "structure_tracker/tau_exit",
+                        params_.structure_tracker.tau_exit);
+  params_.structure_tracker.search_margin =
+      LoadParam<double>(private_nh_, "structure_tracker/search_margin",
+                        params_.structure_tracker.search_margin);
+  params_.structure_tracker.orphan_radius =
+      LoadParam<double>(private_nh_, "structure_tracker/orphan_radius",
+                        params_.structure_tracker.orphan_radius);
+  params_.structure_tracker.orphan_voxel_size =
+      LoadParam<double>(private_nh_, "structure_tracker/orphan_voxel_size",
+                        params_.structure_tracker.orphan_voxel_size);
+  params_.structure_tracker.max_size_gap =
+      LoadParam<double>(private_nh_, "structure_tracker/max_size_gap",
+                        params_.structure_tracker.max_size_gap);
+  params_.structure_tracker.max_normal_deg =
+      LoadParam<double>(private_nh_, "structure_tracker/max_normal_deg",
+                        params_.structure_tracker.max_normal_deg);
+  params_.structure_tracker.min_migration_dist =
+      LoadParam<double>(private_nh_, "structure_tracker/min_migration_dist",
+                        params_.structure_tracker.min_migration_dist);
+  params_.structure_tracker.max_migration_dist =
+      LoadParam<double>(private_nh_, "structure_tracker/max_migration_dist",
+                        params_.structure_tracker.max_migration_dist);
+  params_.structure_tracker.min_migration_confidence =
+      LoadParam<double>(private_nh_, "structure_tracker/min_migration_confidence",
+                        params_.structure_tracker.min_migration_confidence);
+  params_.structure_tracker.orphan_min_points =
+      LoadParam<int>(private_nh_, "structure_tracker/orphan_min_points",
+                     params_.structure_tracker.orphan_min_points);
+  params_.structure_tracker.persistence_confidence =
+      LoadParam<double>(private_nh_, "structure_tracker/persistence_confidence",
+                        params_.structure_tracker.persistence_confidence);
+
+  params_.incremental.enable =
+      LoadParam<bool>(private_nh_, "deform_monitor/incremental/enable",
+                      params_.incremental.enable);
+  params_.incremental.coverage_radius =
+      LoadParam<double>(private_nh_, "deform_monitor/incremental/coverage_radius",
+                        params_.incremental.coverage_radius);
+  params_.incremental.warmup_frames =
+      LoadParam<int>(private_nh_, "deform_monitor/incremental/warmup_frames",
+                     params_.incremental.warmup_frames);
+  params_.incremental.min_visible_frames =
+      LoadParam<int>(private_nh_, "deform_monitor/incremental/min_visible_frames",
+                     params_.incremental.min_visible_frames);
+  params_.incremental.max_new_anchors =
+      LoadParam<int>(private_nh_, "deform_monitor/incremental/max_new_anchors",
+                     params_.incremental.max_new_anchors);
+
+  risk_map_params_.enable = LoadParam<bool>(private_nh_, "deform_monitor/risk_map/enable", risk_map_params_.enable);
+  risk_map_params_.model_version = LoadParam<std::string>(private_nh_, "deform_monitor/risk_map/model_version", risk_map_params_.model_version);
+  risk_map_params_.calibration_version = LoadParam<std::string>(private_nh_, "deform_monitor/risk_map/calibration_version", risk_map_params_.calibration_version);
+  risk_map_params_.voxel_size = LoadParam<double>(private_nh_, "deform_monitor/risk_map/voxel_size", risk_map_params_.voxel_size);
+  risk_map_params_.sigma_mu = LoadParam<double>(private_nh_, "deform_monitor/risk_map/sigma_mu", risk_map_params_.sigma_mu);
+  risk_map_params_.evidence_block_frames = LoadParam<int>(private_nh_, "deform_monitor/risk_map/evidence_block_frames", risk_map_params_.evidence_block_frames);
+  risk_map_params_.max_block_duration = LoadParam<double>(private_nh_, "deform_monitor/risk_map/max_block_duration", risk_map_params_.max_block_duration);
+  const std::string pose_temporal_model = LoadParam<std::string>(private_nh_, "deform_monitor/risk_map/pose_temporal_model", "ar1_pose");
+  risk_map_params_.pose_temporal_model = pose_temporal_model == "independent_pose"
+      ? risk_map::PoseTemporalModel::INDEPENDENT_POSE
+      : risk_map::PoseTemporalModel::AR1_POSE;
+  risk_map_params_.pose_correlation_time_sec = LoadParam<double>(private_nh_, "deform_monitor/risk_map/pose_correlation_time_sec", risk_map_params_.pose_correlation_time_sec);
+  risk_map_params_.independent_variance_floor = LoadParam<double>(private_nh_, "deform_monitor/risk_map/independent_variance_floor", risk_map_params_.independent_variance_floor);
+  risk_map_params_.covariance_jitter_initial = LoadParam<double>(private_nh_, "deform_monitor/risk_map/covariance_jitter_initial", risk_map_params_.covariance_jitter_initial);
+  risk_map_params_.covariance_jitter_attempts = LoadParam<int>(private_nh_, "deform_monitor/risk_map/covariance_jitter_attempts", risk_map_params_.covariance_jitter_attempts);
+  risk_map_params_.kappa_floor = LoadParam<double>(private_nh_, "deform_monitor/risk_map/kappa_floor", risk_map_params_.kappa_floor);
+  risk_map_params_.probability_floor = LoadParam<double>(private_nh_, "deform_monitor/risk_map/probability_floor", risk_map_params_.probability_floor);
+  risk_map_params_.deformation_hazard_on = LoadParam<double>(private_nh_, "deform_monitor/risk_map/deformation_hazard_on", risk_map_params_.deformation_hazard_on);
+  risk_map_params_.deformation_hazard_off = LoadParam<double>(private_nh_, "deform_monitor/risk_map/deformation_hazard_off", risk_map_params_.deformation_hazard_off);
+  risk_map_params_.novel_hazard_on = LoadParam<double>(private_nh_, "deform_monitor/risk_map/novel_hazard_on", risk_map_params_.novel_hazard_on);
+  risk_map_params_.novel_hazard_off = LoadParam<double>(private_nh_, "deform_monitor/risk_map/novel_hazard_off", risk_map_params_.novel_hazard_off);
+  risk_map_params_.reference_beta_a = LoadParam<double>(private_nh_, "deform_monitor/risk_map/reference_beta_a", risk_map_params_.reference_beta_a);
+  risk_map_params_.reference_beta_b = LoadParam<double>(private_nh_, "deform_monitor/risk_map/reference_beta_b", risk_map_params_.reference_beta_b);
+  risk_map_params_.reference_min_coverage = LoadParam<int>(private_nh_, "deform_monitor/risk_map/reference_min_coverage", risk_map_params_.reference_min_coverage);
+  risk_map_params_.reference_free_threshold = LoadParam<double>(private_nh_, "deform_monitor/risk_map/reference_free_threshold", risk_map_params_.reference_free_threshold);
+  risk_map_params_.reference_occupied_threshold = LoadParam<double>(private_nh_, "deform_monitor/risk_map/reference_occupied_threshold", risk_map_params_.reference_occupied_threshold);
+  risk_map_params_.fov_vertical_min_deg = LoadParam<double>(private_nh_, "deform_monitor/risk_map/fov_vertical_min_deg", risk_map_params_.fov_vertical_min_deg);
+  risk_map_params_.fov_vertical_max_deg = LoadParam<double>(private_nh_, "deform_monitor/risk_map/fov_vertical_max_deg", risk_map_params_.fov_vertical_max_deg);
+  risk_map_params_.fov_soft_width_deg = LoadParam<double>(private_nh_, "deform_monitor/risk_map/fov_soft_width_deg", risk_map_params_.fov_soft_width_deg);
+  risk_map_params_.min_range = LoadParam<double>(private_nh_, "deform_monitor/risk_map/min_range", risk_map_params_.min_range);
+  risk_map_params_.max_range = LoadParam<double>(private_nh_, "deform_monitor/risk_map/max_range", risk_map_params_.max_range);
+  risk_map_params_.visibility_logit_bias = LoadParam<double>(private_nh_, "deform_monitor/risk_map/visibility_logit_bias", risk_map_params_.visibility_logit_bias);
+  risk_map_params_.visibility_logit_scale = LoadParam<double>(private_nh_, "deform_monitor/risk_map/visibility_logit_scale", risk_map_params_.visibility_logit_scale);
+  risk_map_params_.q0_default = LoadParam<double>(private_nh_, "deform_monitor/risk_map/q0_default", risk_map_params_.q0_default);
+  risk_map_params_.q0_min = LoadParam<double>(private_nh_, "deform_monitor/risk_map/q0_min", risk_map_params_.q0_min);
+  risk_map_params_.q0_range_coefficient = LoadParam<double>(private_nh_, "deform_monitor/risk_map/q0_range_coefficient", risk_map_params_.q0_range_coefficient);
+  risk_map_params_.q0_incidence_coefficient = LoadParam<double>(private_nh_, "deform_monitor/risk_map/q0_incidence_coefficient", risk_map_params_.q0_incidence_coefficient);
+  risk_map_params_.q0_support_quality_coefficient = LoadParam<double>(private_nh_, "deform_monitor/risk_map/q0_support_quality_coefficient", risk_map_params_.q0_support_quality_coefficient);
+  risk_map_params_.q0_edge_offset = LoadParam<double>(private_nh_, "deform_monitor/risk_map/q0_edge_offset", risk_map_params_.q0_edge_offset);
+  risk_map_params_.q0_band_offset = LoadParam<double>(private_nh_, "deform_monitor/risk_map/q0_band_offset", risk_map_params_.q0_band_offset);
+  risk_map_params_.clutter_rate = LoadParam<double>(private_nh_, "deform_monitor/risk_map/clutter_rate", risk_map_params_.clutter_rate);
+  risk_map_params_.occupied_rate_scale = LoadParam<double>(private_nh_, "deform_monitor/risk_map/occupied_rate_scale", risk_map_params_.occupied_rate_scale);
+  risk_map_params_.migration_search_radius = LoadParam<double>(private_nh_, "deform_monitor/risk_map/migration_search_radius", risk_map_params_.migration_search_radius);
+  risk_map_params_.migration_distance_scale = LoadParam<double>(private_nh_, "deform_monitor/risk_map/migration_distance_scale", risk_map_params_.migration_distance_scale);
+  risk_map_params_.gone_prior = LoadParam<double>(private_nh_, "deform_monitor/risk_map/gone_prior", risk_map_params_.gone_prior);
+  risk_map_params_.decision_weight_deformation = LoadParam<double>(private_nh_, "deform_monitor/risk_map/decision_weight_deformation", risk_map_params_.decision_weight_deformation);
+  risk_map_params_.decision_weight_novel = LoadParam<double>(private_nh_, "deform_monitor/risk_map/decision_weight_novel", risk_map_params_.decision_weight_novel);
+  risk_map_params_.decision_weight_unknown = LoadParam<double>(private_nh_, "deform_monitor/risk_map/decision_weight_unknown", risk_map_params_.decision_weight_unknown);
+  risk_map_params_.robot_inflation_radius = LoadParam<double>(private_nh_, "deform_monitor/risk_map/robot_inflation_radius", risk_map_params_.robot_inflation_radius);
+  risk_map_params_.hazard_projection_length = LoadParam<double>(private_nh_, "deform_monitor/risk_map/hazard_projection_length", risk_map_params_.hazard_projection_length);
+  const std::string unknown_policy = LoadParam<std::string>(private_nh_, "deform_monitor/risk_map/unknown_policy", "fixed_unknown_cost");
+  risk_map_params_.unknown_policy = unknown_policy == "lethal_unknown"
+      ? risk_map::UnknownPolicy::LETHAL_UNKNOWN
+      : (unknown_policy == "explorable_unknown"
+             ? risk_map::UnknownPolicy::EXPLORABLE_UNKNOWN
+             : risk_map::UnknownPolicy::FIXED_UNKNOWN_COST);
+  risk_map_params_.unknown_fixed_cost = LoadParam<double>(private_nh_, "deform_monitor/risk_map/unknown_fixed_cost", risk_map_params_.unknown_fixed_cost);
+  risk_map_params_.unknown_explorable_cost = LoadParam<double>(private_nh_, "deform_monitor/risk_map/unknown_explorable_cost", risk_map_params_.unknown_explorable_cost);
+  risk_map_params_.region_cost_threshold = LoadParam<double>(private_nh_, "deform_monitor/risk_map/region_cost_threshold", risk_map_params_.region_cost_threshold);
+  risk_map_params_.region_min_voxels = LoadParam<int>(private_nh_, "deform_monitor/risk_map/region_min_voxels", risk_map_params_.region_min_voxels);
+  risk_map_params_.export_enable = LoadParam<bool>(private_nh_, "deform_monitor/risk_map/export_enable", risk_map_params_.export_enable);
+  risk_map_params_.export_directory = LoadParam<std::string>(private_nh_, "deform_monitor/risk_map/export_directory", risk_map_params_.export_directory);
+  risk_map_params_.export_rate_hz = LoadParam<double>(private_nh_, "deform_monitor/risk_map/export_rate_hz", risk_map_params_.export_rate_hz);
+  risk_map_params_.export_queue_capacity = static_cast<size_t>(LoadParam<int>(private_nh_, "deform_monitor/risk_map/export_queue_capacity", static_cast<int>(risk_map_params_.export_queue_capacity)));
+
+  runtime_output_dir_ =
+      LoadParam<std::string>(private_nh_, "deform_monitor/runtime/output_dir", runtime_output_dir_);
+  runtime_output_dir_param_name_ = LoadParam<std::string>(
+      private_nh_,
+      "deform_monitor/runtime/output_dir_param",
+      runtime_output_dir_param_name_);
+
+  params_.ablation.variant =
+      LoadParam<std::string>(private_nh_, "deform_monitor/ablation/variant", params_.ablation.variant);
+  params_.ablation.disable_covariance_inflation =
+      LoadParam<bool>(private_nh_,
+                      "deform_monitor/ablation/disable_covariance_inflation",
+                      params_.ablation.disable_covariance_inflation);
+  params_.ablation.disable_type_constraint =
+      LoadParam<bool>(private_nh_,
+                      "deform_monitor/ablation/disable_type_constraint",
+                      params_.ablation.disable_type_constraint);
+  params_.ablation.single_model_ekf =
+      LoadParam<bool>(private_nh_,
+                      "deform_monitor/ablation/single_model_ekf",
+                      params_.ablation.single_model_ekf);
+  params_.ablation.disable_cusum =
+      LoadParam<bool>(private_nh_,
+                      "deform_monitor/ablation/disable_cusum",
+                      params_.ablation.disable_cusum);
+  params_.ablation.disable_directional_accumulation =
+      LoadParam<bool>(private_nh_,
+                      "deform_monitor/ablation/disable_directional_accumulation",
+                      params_.ablation.disable_directional_accumulation);
+  params_.ablation.disable_drift_compensation =
+      LoadParam<bool>(private_nh_,
+                      "deform_monitor/ablation/disable_drift_compensation",
+                      params_.ablation.disable_drift_compensation);
+
+  ApplyAblationOverrides();
+
+  anchor_builder_.SetParams(params_.anchor);
+  anchor_builder_.SetObjectAssociationParams(params_.object_association);
+  obs_extractor_.SetObjectAssociationParams(params_.object_association);
+  scalar_builder_.SetParams(params_.observation, params_.noise);
+  obs_extractor_.SetParams(params_.observation);
+  obs_extractor_.SetTemporalParams(params_.temporal);
+  obs_extractor_.SetNoiseParams(params_.noise);
+  obs_extractor_.SetCovarianceParams(params_.covariance);
+  obs_extractor_.SetObservabilityParams(params_.observability);
+  obs_extractor_.SetMeasurementBuilder(scalar_builder_);
+  risk_obs_extractor_.SetObjectAssociationParams(params_.object_association);
+  risk_obs_extractor_.SetParams(params_.observation);
+  risk_obs_extractor_.SetTemporalParams(params_.temporal);
+  risk_obs_extractor_.SetNoiseParams(params_.noise);
+  risk_obs_extractor_.SetCovarianceParams(params_.covariance);
+  risk_obs_extractor_.SetObservabilityParams(params_.observability);
+  risk_obs_extractor_.SetMeasurementBuilder(scalar_builder_);
+  // The probabilistic likelihood must see the uncensored scalar residual.
+  // The legacy detector keeps its defensive innovation gate, but applying it
+  // here would make channel presence depend on z while using an untruncated
+  // Gaussian likelihood downstream.
+  risk_obs_extractor_.SetMeasurementInnovationGate(false);
+  risk_map_pipeline_.SetParams(risk_map_params_);
+  imm_filter_.SetParams(params_.imm, params_.observability, params_.significance,
+                        params_.directional_motion, params_.reference.tau_mu0);
+  weak_plane_motion_detector_.SetParams(params_.weak_plane_motion);
+  clusterer_.SetParams(params_.cluster);
+  region_hypothesis_builder_.SetParams(params_.structure_correspondence);
+  region_correspondence_solver_.SetParams(params_.structure_correspondence);
+  risk_adapter_.SetParams(params_.risk_visualization, params_.significance,
+                          params_.graph_temporal, params_.weak_plane_motion);
+  risk_field_builder_.SetParams(params_.risk_visualization);
+  ref_manager_.SetParams(params_.reference);
+  risk_viz_publisher_.SetParams(params_.risk_visualization);
+  persistent_risk_tracker_.SetParams(params_.persistent_risk);
+  structure_viz_publisher_.SetParams(params_.structure_correspondence);
+  viz_publisher_.SetParams(params_.visualization, nh_);
+}
+
+void DeformMonitorV3Node::ApplyAblationOverrides() {
+  if (params_.ablation.disable_covariance_inflation) {
+    params_.covariance.alpha_xi = 1.0;
+  }
+  if (params_.ablation.disable_type_constraint) {
+    params_.imm.enable_type_constraint = false;
+  }
+  if (params_.ablation.single_model_ekf) {
+    params_.imm.enable_model_competition = false;
+  }
+  if (params_.ablation.disable_cusum) {
+    params_.significance.enable_cusum = false;
+  }
+  if (params_.ablation.disable_directional_accumulation) {
+    params_.directional_motion.enable = false;
+  }
+  if (params_.ablation.disable_drift_compensation) {
+    params_.background_bias.enable = false;
+  }
+
+  // The recorder snapshots the ROS parameter tree. Keep it aligned with the
+  // effective values after ablation overrides, not only the loaded YAML.
+  private_nh_.setParam("deform_monitor/covariance/alpha_xi", params_.covariance.alpha_xi);
+  private_nh_.setParam("deform_monitor/imm/enable_type_constraint",
+                       params_.imm.enable_type_constraint);
+  private_nh_.setParam("deform_monitor/imm/enable_model_competition",
+                       params_.imm.enable_model_competition);
+  private_nh_.setParam("deform_monitor/significance/enable_cusum",
+                       params_.significance.enable_cusum);
+  private_nh_.setParam("deform_monitor/directional_motion/enable",
+                       params_.directional_motion.enable);
+  private_nh_.setParam("deform_monitor/background_bias/enable",
+                       params_.background_bias.enable);
+}
+
+void DeformMonitorV3Node::Run() {
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    stop_worker_ = false;
+  }
+  worker_thread_ = std::thread(&DeformMonitorV3Node::WorkerLoop, this);
+  ros::spin();
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    stop_worker_ = true;
+  }
+  data_cv_.notify_all();
+  if (worker_thread_.joinable()) {
+    worker_thread_.join();
+  }
+  // Give the ROS publisher transport time to drain large anchor messages
+  // before publisher destructors are called. anchor_observations frames are
+  // ~17 MB each; without this sleep the last ~13 frames are lost on SIGINT.
+  std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+  ShutdownDiagnosticsLog();
+}
+
+void DeformMonitorV3Node::WorkerLoop() {
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(data_mutex_);
+      data_cv_.wait(lock, [this]() {
+        return stop_worker_ || (!cloud_queue_.empty() && !covariance_queue_.empty());
+      });
+      if (stop_worker_) {
+        return;
+      }
+    }
+    TryProcessQueuedFrames();
+  }
+}
+
+void DeformMonitorV3Node::CloudCallback(const sensor_msgs::PointCloud2ConstPtr& msg) {
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    cloud_queue_.push_back(TimedCloud{*msg});
+    TrimQueue(&cloud_queue_, 200);
+    ++cloud_msg_count_;
+    last_cloud_stamp_ = msg->header.stamp;
+    if (!first_cloud_logged_) {
+      std::cout << "[微动监测V3] 首次收到点云: stamp=" << msg->header.stamp.toSec()
+                << " frame_id=" << msg->header.frame_id
+                << " width=" << msg->width
+                << " height=" << msg->height << std::endl;
+      first_cloud_logged_ = true;
+    }
+  }
+  data_cv_.notify_one();
+  MaybePrintPipelineStatus();
+}
+
+void DeformMonitorV3Node::CovarianceCallback(const fast_lio::LioOdomCovConstPtr& msg) {
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    covariance_queue_.push_back(TimedCov{*msg});
+    TrimQueue(&covariance_queue_, 400);
+    ++covariance_msg_count_;
+    last_covariance_stamp_ = msg->odom.header.stamp;
+    if (!first_covariance_logged_) {
+      std::cout << "[微动监测V3] 首次收到完整协方差: stamp=" << msg->odom.header.stamp.toSec()
+                << " state_dim=" << msg->state_dim
+                << " cov_size=" << msg->state_covariance.size() << std::endl;
+      first_covariance_logged_ = true;
+    }
+  }
+  data_cv_.notify_one();
+  MaybePrintPipelineStatus();
+}
+
+void DeformMonitorV3Node::ResetReferenceCallback(const std_msgs::EmptyConstPtr& /*msg*/) {
+  {
+    std::lock_guard<std::mutex> processing_lock(processing_mutex_);
+    std::lock_guard<std::mutex> data_lock(data_mutex_);
+    ResetReferenceStateLocked();
+  }
+  PublishEmptyResults(ros::Time::now());
+  if (diagnostics_log_.is_open()) {
+    diagnostics_log_ << "[RESET] wall_time=" << ros::WallTime::now().toSec()
+                     << " reason=manual_reset_reference"
+                     << " new_reference_epoch=" << reference_epoch_id_
+                     << std::endl;
+    diagnostics_log_.flush();
+  }
+  std::cout << "[微动监测V3] 已收到手动重置静态参考命令，将从后续同步帧重新初始化"
+            << std::endl;
+}
+
+double DeformMonitorV3Node::TimeDistanceSec(const ros::Time& a, const ros::Time& b) {
+  return std::abs((a - b).toSec());
+}
+
+bool DeformMonitorV3Node::EstimateBackgroundBias(const CurrentObservationVector& observations,
+                                                 Eigen::Vector3d* bias_R,
+                                                 size_t* used_anchor_count,
+                                                 size_t* used_scalar_count,
+                                                 size_t* total_comparable_plane_count) const {
+  if (!bias_R) {
+    return false;
+  }
+  *bias_R = Eigen::Vector3d::Zero();
+  if (used_anchor_count) {
+    *used_anchor_count = 0;
+  }
+  if (used_scalar_count) {
+    *used_scalar_count = 0;
+  }
+  if (total_comparable_plane_count) {
+    *total_comparable_plane_count = 0;
+  }
+  if (!params_.background_bias.enable || observations.size() != anchors_.size()) {
+    return false;
+  }
+
+  struct ScalarEq {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    Eigen::Vector3d h = Eigen::Vector3d::Zero();
+    double z = 0.0;
+    double r = 1.0;
+  };
+
+  
+  
+  struct CandidateAnchor {
+    size_t obs_index;
+    double disp_norm;
+  };
+  std::vector<CandidateAnchor> candidates;
+  candidates.reserve(128);
+
+  for (size_t i = 0; i < observations.size(); ++i) {
+    const auto& obs = observations[i];
+    const auto& anchor = anchors_[i];
+    if (anchor.type != AnchorType::PLANE) {
+      continue;
+    }
+    if (!obs.comparable || obs.reacquired) {
+      continue;
+    }
+    if (obs.support_count < params_.background_bias.min_support_points) {
+      continue;
+    }
+    if (obs.cmp_score < params_.background_bias.min_cmp_score) {
+      continue;
+    }
+    candidates.push_back({i, obs.matched_delta_R.norm()});
+  }
+
+  if (total_comparable_plane_count) {
+    *total_comparable_plane_count = candidates.size();
+  }
+
+  
+  const double thresholds[] = {
+      params_.background_bias.max_anchor_disp,
+      params_.background_bias.adaptive_disp_step1,
+      params_.background_bias.adaptive_disp_step2};
+  const size_t min_anchors =
+      static_cast<size_t>(std::max(1, params_.background_bias.min_anchor_count));
+  const size_t min_scalars =
+      static_cast<size_t>(std::max(1, params_.background_bias.min_scalar_count));
+
+  for (const double threshold : thresholds) {
+    AlignedVector<ScalarEq> eqs;
+    eqs.reserve(256);
+    size_t anchor_count = 0;
+
+    for (const auto& cand : candidates) {
+      if (cand.disp_norm > threshold) {
+        continue;
+      }
+      const auto& obs = observations[cand.obs_index];
+      size_t added_for_anchor = 0;
+      for (const auto& scalar : obs.scalars) {
+        if (scalar.type != 0 && scalar.type != 2) {
+          continue;
+        }
+        ScalarEq eq;
+        eq.h = scalar.h_R;
+        eq.z = scalar.z;
+        eq.r = std::max(1.0e-9, scalar.r);
+        eqs.push_back(eq);
+        ++added_for_anchor;
+      }
+      if (added_for_anchor > 0) {
+        ++anchor_count;
+      }
+    }
+
+    if (anchor_count < min_anchors || eqs.size() < min_scalars) {
+      continue;  
+    }
+
+    
+    Eigen::Vector3d b = Eigen::Vector3d::Zero();
+    const double ridge = std::max(1.0e-12, params_.background_bias.ridge_lambda);
+    const double huber_delta = std::max(1.0e-4, params_.background_bias.huber_delta);
+    for (int iter = 0; iter < 3; ++iter) {
+      Eigen::Matrix3d A = ridge * Eigen::Matrix3d::Identity();
+      Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
+      for (const auto& eq : eqs) {
+        const double residual = eq.z - eq.h.dot(b);
+        const double robust_w =
+            std::min(1.0, huber_delta / std::max(huber_delta, std::abs(residual)));
+        const double w = robust_w / eq.r;
+        A += w * (eq.h * eq.h.transpose());
+        rhs += w * eq.h * eq.z;
+      }
+      Eigen::LDLT<Eigen::Matrix3d> ldlt(A);
+      if (ldlt.info() != Eigen::Success) {
+        return false;
+      }
+      b = ldlt.solve(rhs);
+    }
+
+    if (!b.allFinite() || b.norm() > params_.background_bias.max_bias_norm) {
+      return false;
+    }
+
+    *bias_R = b;
+    if (used_anchor_count) {
+      *used_anchor_count = anchor_count;
+    }
+    if (used_scalar_count) {
+      *used_scalar_count = eqs.size();
+    }
+    return true;
+  }
+
+  return false;
+}
+
+void DeformMonitorV3Node::ApplyBackgroundBias(const Eigen::Vector3d& bias_R,
+                                              CurrentObservationVector* observations) const {
+  if (!observations) {
+    return;
+  }
+  for (auto& obs : *observations) {
+    for (auto& scalar : obs.scalars) {
+      scalar.z -= scalar.h_R.dot(bias_R);
+    }
+    if (obs.matched_delta_R.allFinite()) {
+      obs.matched_delta_R -= bias_R;
+      obs.matched_center_R -= bias_R;
+    }
+  }
+}
+
+void DeformMonitorV3Node::UpdateLocalContrastStates() {
+  for (auto& state : anchor_states_) {
+    state.local_bg_count = 0;
+    state.local_bg_disp_norm = 0.0;
+    state.local_bg_sigma = 0.0;
+    state.local_contrast_score = 0.0;
+    state.local_rel_norm = state.disp_norm;
+    state.local_rel_normal = state.disp_normal;
+    state.local_rel_edge = state.disp_edge;
+    state.plane_bg_count = 0;
+    state.plane_bg_disp_norm = 0.0;
+    state.plane_bg_sigma = 0.0;
+    state.plane_contrast_score = 0.0;
+    state.plane_rel_norm = state.disp_norm;
+    state.plane_rel_normal = state.disp_normal;
+    state.plane_rel_edge = state.disp_edge;
+  }
+
+  if (!params_.local_contrast.enable || anchors_.size() != anchor_states_.size() ||
+      observations_.size() != anchors_.size()) {
+    return;
+  }
+
+  const double radius = std::max(0.05, params_.local_contrast.radius);
+  const double sigma_dist = std::max(0.05, 0.6 * radius);
+  const double sigma_dist2 = sigma_dist * sigma_dist;
+  const double min_bg_sigma =
+      std::max(1.0e-4, params_.local_contrast.min_background_sigma);
+  const double max_background_disp =
+      std::max(1.0e-4, params_.local_contrast.max_background_disp);
+  const auto compute_bg_stats =
+      [&](const AnchorReference& anchor,
+          const AnchorTrackState& state,
+          const std::vector<std::pair<double, Eigen::Vector3d>>& samples,
+          int* bg_count,
+          double* bg_disp_norm,
+          double* bg_sigma_out,
+          double* contrast_score,
+          double* rel_norm,
+          double* rel_normal,
+          double* rel_edge) {
+        if (!bg_count || !bg_disp_norm || !bg_sigma_out || !contrast_score || !rel_norm ||
+            !rel_normal || !rel_edge) {
+          return;
+        }
+        if (samples.empty()) {
+          return;
+        }
+        Eigen::Vector3d weighted_bg = Eigen::Vector3d::Zero();
+        double weight_sum = 0.0;
+        for (const auto& sample : samples) {
+          weighted_bg += sample.first * sample.second;
+          weight_sum += sample.first;
+        }
+        if (weight_sum < 1.0e-9) {
+          return;
+        }
+        const Eigen::Vector3d bg_mean = weighted_bg / weight_sum;
+        double weighted_var = 0.0;
+        for (const auto& sample : samples) {
+          weighted_var += sample.first * (sample.second - bg_mean).squaredNorm();
+        }
+        weighted_var /= weight_sum;
+        const double bg_sigma =
+            std::sqrt(std::max(min_bg_sigma * min_bg_sigma, weighted_var / 3.0));
+
+        const ObservableSubspace subspace = BuildObservableSubspace(anchor);
+        const Eigen::Vector3d ui = ProjectObservableVector(
+            state.x_mix.block<3, 1>(0, 0), subspace, state.dof_obs);
+        const Eigen::Vector3d rel =
+            ProjectObservableVector(ui - bg_mean, subspace, state.dof_obs);
+        const double rel_norm_v = rel.norm();
+        const double rel_normal_v = std::abs(subspace.basis_R.col(0).dot(rel));
+        const double rel_edge_v =
+            subspace.rank > 1 ? std::abs(subspace.basis_R.col(1).dot(rel)) : 0.0;
+        const double signal = anchor.type == AnchorType::PLANE
+                                  ? std::max(rel_norm_v, 1.5 * rel_normal_v)
+                                  : std::max(rel_norm_v,
+                                             std::max(1.2 * rel_edge_v, rel_normal_v));
+
+        *bg_count = static_cast<int>(samples.size());
+        *bg_disp_norm = bg_mean.norm();
+        *bg_sigma_out = bg_sigma;
+        *contrast_score = signal / bg_sigma;
+        *rel_norm = rel_norm_v;
+        *rel_normal = rel_normal_v;
+        *rel_edge = rel_edge_v;
+      };
+
+  for (size_t i = 0; i < anchors_.size(); ++i) {
+    std::vector<std::pair<double, Eigen::Vector3d>> bg_samples;
+    bg_samples.reserve(32);
+    std::vector<std::pair<double, Eigen::Vector3d>> plane_bg_samples;
+    plane_bg_samples.reserve(16);
+
+    const bool require_plane_neighbors = anchors_[i].type == AnchorType::PLANE;
+    for (const int neighbor_idx : anchors_[i].neighbor_indices) {
+      const size_t j = static_cast<size_t>(neighbor_idx);
+      const double dist = (anchors_[i].center_R - anchors_[j].center_R).norm();
+      if (dist > radius) {
+        continue;
+      }
+      if (!anchor_states_[j].comparable || anchor_states_[j].reacquired) {
+        continue;
+      }
+      if (anchor_states_[j].mode == DetectionMode::DISAPPEARANCE) {
+        continue;
+      }
+      if (observations_[j].support_count < params_.local_contrast.min_support_points ||
+          observations_[j].cmp_score < params_.local_contrast.min_cmp_score) {
+        continue;
+      }
+      if (anchor_states_[j].disp_norm > max_background_disp) {
+        continue;
+      }
+      if (require_plane_neighbors && anchors_[j].type != AnchorType::PLANE) {
+        continue;
+      }
+      if (AngleBetweenDeg(anchors_[i].normal_R, anchors_[j].normal_R) >
+          params_.local_contrast.tau_bg_normal_deg) {
+        continue;
+      }
+
+      const double w = std::exp(-(dist * dist) / (2.0 * sigma_dist2));
+      const ObservableSubspace neighbor_subspace = BuildObservableSubspace(anchors_[j]);
+      const Eigen::Vector3d uj = ProjectObservableVector(
+          anchor_states_[j].x_mix.block<3, 1>(0, 0),
+          neighbor_subspace,
+          anchor_states_[j].dof_obs);
+      bg_samples.emplace_back(w, uj);
+      if (params_.local_contrast.enable_plane_background_for_edges &&
+          anchors_[i].type != AnchorType::PLANE &&
+          anchors_[j].type == AnchorType::PLANE) {
+        plane_bg_samples.emplace_back(w, uj);
+      }
+    }
+
+    if (bg_samples.size() >=
+        static_cast<size_t>(std::max(1, params_.local_contrast.min_neighbors))) {
+      compute_bg_stats(anchors_[i], anchor_states_[i], bg_samples,
+                       &anchor_states_[i].local_bg_count,
+                       &anchor_states_[i].local_bg_disp_norm,
+                       &anchor_states_[i].local_bg_sigma,
+                       &anchor_states_[i].local_contrast_score,
+                       &anchor_states_[i].local_rel_norm,
+                       &anchor_states_[i].local_rel_normal,
+                       &anchor_states_[i].local_rel_edge);
+    }
+    if (params_.local_contrast.enable_plane_background_for_edges &&
+        anchors_[i].type != AnchorType::PLANE &&
+        plane_bg_samples.size() >=
+            static_cast<size_t>(std::max(1, params_.local_contrast.min_plane_neighbors))) {
+      compute_bg_stats(anchors_[i], anchor_states_[i], plane_bg_samples,
+                       &anchor_states_[i].plane_bg_count,
+                       &anchor_states_[i].plane_bg_disp_norm,
+                       &anchor_states_[i].plane_bg_sigma,
+                       &anchor_states_[i].plane_contrast_score,
+                       &anchor_states_[i].plane_rel_norm,
+                       &anchor_states_[i].plane_rel_normal,
+                       &anchor_states_[i].plane_rel_edge);
+    }
+  }
+}
+
+void DeformMonitorV3Node::UpdateGraphTemporalStates(const ros::Time& stamp) {
+  for (auto& state : anchor_states_) {
+    state.graph_neighbor_count = 0;
+    state.graph_coherent_score = 0.0;
+    state.graph_temporal_score = 0.0;
+    state.graph_persistence_score = 0.0;
+    state.graph_diff_norm = 0.0;
+    state.graph_candidate = false;
+  }
+
+  if (!params_.graph_temporal.enable || anchors_.size() != anchor_states_.size() ||
+      anchors_.empty()) {
+    return;
+  }
+
+  const double radius =
+      std::max(std::max(0.01, params_.graph_temporal.spatial_hash_size),
+               params_.graph_temporal.radius);
+  const double tau_disp_cos = std::max(-0.99, std::min(0.99, params_.graph_temporal.tau_disp_cos));
+  const double tau_coherent_diff = std::max(1.0e-6, params_.graph_temporal.tau_coherent_diff);
+  const double tau_temporal_change = std::max(1.0e-6, params_.graph_temporal.tau_temporal_change);
+  const double alpha = std::max(0.0, std::min(0.98, params_.graph_temporal.ema_alpha));
+  const double min_anchor_disp = std::max(1.0e-6, params_.graph_temporal.min_anchor_disp);
+
+  std::vector<int> neighbor_count(anchors_.size(), 0);
+  std::vector<double> coherent_sum(anchors_.size(), 0.0);
+  std::vector<double> temporal_sum(anchors_.size(), 0.0);
+  std::vector<double> persistence_sum(anchors_.size(), 0.0);
+  std::vector<double> diff_sum(anchors_.size(), 0.0);
+
+  auto make_edge_key = [](int a, int b) {
+    if (a > b) {
+      std::swap(a, b);
+    }
+    return EdgeKey{a, b};
+  };
+
+  for (size_t i = 0; i < anchors_.size(); ++i) {
+    const AnchorTrackState& state_i = anchor_states_[i];
+    if (state_i.gate_state != ObsGateState::OBSERVABLE_MATCHED ||
+        !state_i.observable || !state_i.comparable) {
+      continue;
+    }
+
+    const Eigen::Vector3d ui = ProjectObservableVector(
+        state_i.x_mix.block<3, 1>(0, 0),
+        BuildObservableSubspace(anchors_[i]),
+        state_i.dof_obs);
+    const double ni = ui.norm();
+
+    for (const int neighbor_idx : anchors_[i].neighbor_indices) {
+      const size_t j = static_cast<size_t>(neighbor_idx);
+      if (j <= i) {
+        continue;
+      }
+      const AnchorTrackState& state_j = anchor_states_[j];
+      if (state_j.gate_state != ObsGateState::OBSERVABLE_MATCHED ||
+          !state_j.observable || !state_j.comparable) {
+        continue;
+      }
+      const double dist = (anchors_[i].center_R - anchors_[j].center_R).norm();
+      if (dist > radius) {
+        continue;
+      }
+      if (AngleBetweenDeg(anchors_[i].normal_R, anchors_[j].normal_R) >
+          params_.graph_temporal.tau_normal_deg) {
+        continue;
+      }
+
+      const Eigen::Vector3d uj = ProjectObservableVector(
+          state_j.x_mix.block<3, 1>(0, 0),
+          BuildObservableSubspace(anchors_[j]),
+          state_j.dof_obs);
+      const double nj = uj.norm();
+      const double min_mag = std::min(ni, nj);
+      if (min_mag < 0.5 * min_anchor_disp) {
+        continue;
+      }
+
+      double dir_cos = 1.0;
+      if (ni > 1.0e-6 && nj > 1.0e-6) {
+        dir_cos = ui.dot(uj) / (ni * nj);
+      }
+      if (dir_cos < tau_disp_cos) {
+        continue;
+      }
+
+      const Eigen::Vector3d delta_ij = ui - uj;
+      const double diff_norm = delta_ij.norm();
+      const double mag_support = Clamp01(min_mag / std::max(min_anchor_disp, 1.0e-6));
+      const double dir_support =
+          Clamp01((dir_cos - tau_disp_cos) / std::max(1.0e-6, 1.0 - tau_disp_cos));
+      const double diff_support = std::exp(-diff_norm / tau_coherent_diff);
+      const double edge_coherence = mag_support * dir_support * diff_support;
+      if (edge_coherence < 1.0e-3) {
+        continue;
+      }
+
+      const EdgeKey edge_key = make_edge_key(anchor_states_[i].id, anchor_states_[j].id);
+      EdgeTemporalState& edge_state = edge_temporal_states_[edge_key];
+      const Eigen::Vector3d prev_delta = edge_state.delta_ema;
+      const double temporal_obs =
+          std::exp(-(delta_ij - prev_delta).norm() / tau_temporal_change);
+      edge_state.delta_ema = alpha * edge_state.delta_ema + (1.0 - alpha) * delta_ij;
+      edge_state.coherent_ema =
+          alpha * edge_state.coherent_ema + (1.0 - alpha) * edge_coherence;
+      edge_state.temporal_consistency =
+          alpha * edge_state.temporal_consistency + (1.0 - alpha) * temporal_obs;
+      if (params_.significance.enable_cusum) {
+        
+        const double gt_lambda = params_.graph_temporal.cusum_lambda;
+        const double gt_cap = 3.0 * params_.graph_temporal.cusum_h;
+        edge_state.persistence_score =
+            std::min(gt_cap,
+                     std::max(0.0,
+                              gt_lambda * edge_state.persistence_score +
+                                  edge_coherence -
+                                  params_.graph_temporal.cusum_k));
+      } else {
+        edge_state.persistence_score = 0.0;
+      }
+      if (edge_coherence > 0.2) {
+        ++edge_state.valid_streak;
+      } else {
+        edge_state.valid_streak = std::max(0, edge_state.valid_streak - 1);
+      }
+      edge_state.last_update = stamp;
+
+      ++neighbor_count[i];
+      ++neighbor_count[j];
+      coherent_sum[i] += edge_state.coherent_ema;
+      coherent_sum[j] += edge_state.coherent_ema;
+      temporal_sum[i] += edge_state.temporal_consistency;
+      temporal_sum[j] += edge_state.temporal_consistency;
+      persistence_sum[i] += edge_state.persistence_score;
+      persistence_sum[j] += edge_state.persistence_score;
+      diff_sum[i] += diff_norm;
+      diff_sum[j] += diff_norm;
+    }
+  }
+
+  for (size_t i = 0; i < anchor_states_.size(); ++i) {
+    AnchorTrackState& state = anchor_states_[i];
+    if (neighbor_count[i] <= 0) {
+      continue;
+    }
+    const double count = static_cast<double>(neighbor_count[i]);
+    state.graph_neighbor_count = neighbor_count[i];
+    state.graph_coherent_score = coherent_sum[i] / count;
+    state.graph_temporal_score = temporal_sum[i] / count;
+    state.graph_persistence_score = persistence_sum[i] / count;
+    state.graph_diff_norm = diff_sum[i] / count;
+
+    const bool enough_neighbors =
+        state.graph_neighbor_count >= std::max(1, params_.graph_temporal.min_neighbors);
+    const bool matched_now =
+        state.gate_state == ObsGateState::OBSERVABLE_MATCHED && state.observable && state.comparable;
+    const bool coherent_graph =
+        state.graph_coherent_score > params_.graph_temporal.tau_graph_support &&
+        state.graph_temporal_score > params_.graph_temporal.tau_graph_temporal;
+    const bool persistent_graph =
+        params_.significance.enable_cusum &&
+        state.graph_persistence_score > params_.graph_temporal.cusum_h;
+    const bool motion_seed =
+        state.disp_norm > min_anchor_disp ||
+        (params_.significance.enable_cusum &&
+         state.cusum_score > 0.5 * params_.significance.cusum_h);
+    state.graph_candidate = matched_now && enough_neighbors && motion_seed &&
+                            (coherent_graph || persistent_graph);
+  }
+}
+
+bool DeformMonitorV3Node::PopSynchronizedFrame(sensor_msgs::PointCloud2* cloud_msg,
+                                               fast_lio::LioOdomCov* cov_msg) {
+  constexpr double kSyncToleranceSec = 0.05;
+  if (!cloud_msg || !cov_msg) {
+    return false;
+  }
+
+  while (!cloud_queue_.empty() && !covariance_queue_.empty()) {
+    const ros::Time cloud_stamp = cloud_queue_.front().msg.header.stamp;
+    size_t cov_idx = covariance_queue_.size();
+    double best_dist = kSyncToleranceSec;
+    for (size_t i = 0; i < covariance_queue_.size(); ++i) {
+      const ros::Time candidate_stamp = covariance_queue_[i].msg.odom.header.stamp;
+      const double dist = std::abs((candidate_stamp - cloud_stamp).toSec());
+      if (dist <= best_dist) {
+        best_dist = dist;
+        cov_idx = i;
+      }
+    }
+
+    if (cov_idx < covariance_queue_.size()) {
+      *cloud_msg = cloud_queue_.front().msg;
+      *cov_msg = covariance_queue_[cov_idx].msg;
+      cloud_queue_.pop_front();
+      covariance_queue_.erase(covariance_queue_.begin(),
+                              covariance_queue_.begin() + static_cast<long>(cov_idx + 1));
+      return true;
+    }
+
+    const ros::Time cov_stamp = covariance_queue_.front().msg.odom.header.stamp;
+    if (cov_stamp + ros::Duration(kSyncToleranceSec) < cloud_stamp) {
+      covariance_queue_.pop_front();
+      continue;
+    }
+    if (cloud_stamp + ros::Duration(kSyncToleranceSec) < cov_stamp) {
+      cloud_queue_.pop_front();
+      continue;
+    }
+    return false;
+  }
+
+  return false;
+}
+
+void DeformMonitorV3Node::ResetReferenceStateLocked() {
+  ++reference_epoch_id_;
+  reference_initialized_stamp_ = ros::Time();
+  init_frame_count_ = 0;
+  reference_ready_ = false;
+  init_frames_.clear();
+  reference_observation_stats_.Reset();
+  temporal_window_frames_.clear();
+  frames_since_last_window_process_ = 0;
+  edge_temporal_states_.clear();
+
+  anchors_.clear();
+  anchor_states_.clear();
+  observations_.clear();
+  clusters_.clear();
+  old_regions_.clear();
+  new_regions_.clear();
+  structure_motions_.clear();
+  risk_evidence_.clear();
+  risk_voxels_.clear();
+  risk_regions_.clear();
+  persistent_risk_tracks_.clear();
+  persistent_risk_tracker_.Reset();
+  risk_map_pipeline_.Reset(reference_epoch_id_);
+  probabilistic_risk_frame_ = risk_map::RiskMapFrame();
+  probabilistic_risk_frame_valid_ = false;
+
+  structure_unit_tracker_.reset();
+  structure_units_.clear();
+  structure_migrations_.clear();
+
+  cloud_queue_.clear();
+  covariance_queue_.clear();
+
+  incremental_init_frames_.clear();
+  incremental_frame_count_ = 0;
+
+  last_background_bias_R_.setZero();
+  smoothed_background_bias_R_.setZero();
+  has_previous_bias_ = false;
+  drift_estimation_degraded_ = false;
+  last_background_bias_anchor_count_ = 0;
+  last_background_bias_scalar_count_ = 0;
+  logged_anchor_alert_plusplus_.clear();
+  detection_time_base_stamp_ = ros::Time();
+  last_detection_stamp_ = ros::Time();
+  last_processed_stamp_ = ros::Time();
+}
+
+void DeformMonitorV3Node::BuildReferenceAdjacency() {
+  if (anchors_.empty()) {
+    return;
+  }
+
+  const double radius = std::max(
+      params_.local_contrast.radius,
+      std::max(params_.graph_temporal.radius,
+               std::max(params_.cluster.tau_d, params_.cluster.compact_tau_d)));
+  const double voxel_size = std::max(0.01, params_.anchor.voxel_size);
+  const int neighbor_layers = std::max(1, static_cast<int>(std::ceil(radius / voxel_size)));
+
+  for (auto& anchor : anchors_) {
+    anchor.neighbor_indices.clear();
+  }
+
+  std::unordered_map<SpatialVoxelKey, std::vector<size_t>, SpatialVoxelKeyHash> voxel_to_anchor_indices;
+  voxel_to_anchor_indices.reserve(anchors_.size());
+  for (size_t idx = 0; idx < anchors_.size(); ++idx) {
+    SpatialVoxelKey key;
+    key.x = static_cast<int>(std::floor(anchors_[idx].center_R.x() / voxel_size));
+    key.y = static_cast<int>(std::floor(anchors_[idx].center_R.y() / voxel_size));
+    key.z = static_cast<int>(std::floor(anchors_[idx].center_R.z() / voxel_size));
+    voxel_to_anchor_indices[key].push_back(idx);
+  }
+
+  for (size_t i = 0; i < anchors_.size(); ++i) {
+    SpatialVoxelKey center_key;
+    center_key.x = static_cast<int>(std::floor(anchors_[i].center_R.x() / voxel_size));
+    center_key.y = static_cast<int>(std::floor(anchors_[i].center_R.y() / voxel_size));
+    center_key.z = static_cast<int>(std::floor(anchors_[i].center_R.z() / voxel_size));
+    for (int dx = -neighbor_layers; dx <= neighbor_layers; ++dx) {
+      for (int dy = -neighbor_layers; dy <= neighbor_layers; ++dy) {
+        for (int dz = -neighbor_layers; dz <= neighbor_layers; ++dz) {
+          SpatialVoxelKey key{center_key.x + dx, center_key.y + dy, center_key.z + dz};
+          const auto voxel_it = voxel_to_anchor_indices.find(key);
+          if (voxel_it == voxel_to_anchor_indices.end()) {
+            continue;
+          }
+          for (const size_t j : voxel_it->second) {
+            if (j == i) {
+              continue;
+            }
+            const double dist = (anchors_[i].center_R - anchors_[j].center_R).norm();
+            if (dist > radius) {
+              continue;
+            }
+            anchors_[i].neighbor_indices.push_back(static_cast<int>(j));
+          }
+        }
+      }
+    }
+    std::sort(anchors_[i].neighbor_indices.begin(), anchors_[i].neighbor_indices.end());
+    anchors_[i].neighbor_indices.erase(
+        std::unique(anchors_[i].neighbor_indices.begin(), anchors_[i].neighbor_indices.end()),
+        anchors_[i].neighbor_indices.end());
+  }
+}
+
+void DeformMonitorV3Node::TryProcessQueuedFrames() {
+  std::lock_guard<std::mutex> processing_lock(processing_mutex_);
+  while (true) {
+    sensor_msgs::PointCloud2 cloud_msg;
+    fast_lio::LioOdomCov cov_msg;
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      if (!PopSynchronizedFrame(&cloud_msg, &cov_msg)) {
+        break;
+      }
+    }
+
+    FrameInput frame = BuildFrameInput(cloud_msg, cov_msg);
+    ++synchronized_frame_count_;
+    last_processed_stamp_ = frame.stamp;
+    if (!first_sync_logged_) {
+      std::cout << "[微动监测V3] 首次形成同步帧: stamp=" << frame.stamp.toSec()
+                << " cloud_points=" << frame.cloud->size() << std::endl;
+      first_sync_logged_ = true;
+    }
+    InitializeReferenceIfNeeded(frame);
+    if (reference_ready_) {
+      if (!params_.temporal.enable) {
+        ProcessFrame(frame);
+        continue;
+      }
+
+      temporal_window_frames_.push_back(frame);
+      ++frames_since_last_window_process_;
+
+      const size_t max_window_frames =
+          static_cast<size_t>(std::max(1, params_.temporal.window_frames));
+      while (temporal_window_frames_.size() > max_window_frames) {
+        temporal_window_frames_.pop_front();
+      }
+      while (temporal_window_frames_.size() > 1 &&
+             (temporal_window_frames_.back().stamp -
+              temporal_window_frames_.front().stamp).toSec() >
+                 params_.temporal.max_window_sec) {
+        temporal_window_frames_.pop_front();
+      }
+
+      const size_t min_frames =
+          static_cast<size_t>(std::max(1, params_.temporal.min_frames));
+      if (temporal_window_frames_.size() < min_frames) {
+        continue;
+      }
+
+      const size_t step_frames =
+          static_cast<size_t>(std::max(1, params_.temporal.step_frames));
+      if (frames_since_last_window_process_ < step_frames) {
+        continue;
+      }
+
+      ProcessFrameWindow(temporal_window_frames_);
+      frames_since_last_window_process_ = 0;
+    }
+  }
+}
+
+DeformMonitorV3Node::FrameInput DeformMonitorV3Node::BuildFrameInput(
+    const sensor_msgs::PointCloud2& cloud_msg,
+    const fast_lio::LioOdomCov& cov_msg) const {
+  FrameInput frame;
+  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>());
+  pcl::fromROSMsg(cloud_msg, *cloud);
+  const Eigen::Isometry3d T_RL = PoseFromFastLioMsg(cov_msg);
+  frame.pose_cov = PoseCovFromFastLioMsg(cov_msg,
+                                         params_.io.default_rot_sigma,
+                                         params_.io.default_pos_sigma);
+  frame.pose_cov.Sigma_xi =
+      CovarianceExtractor::InflateSigmaXi(frame.pose_cov.Sigma_xi, params_.covariance.alpha_xi);
+  frame.lidar_origin_R = T_RL.translation();
+  frame.stamp = cloud_msg.header.stamp.isZero() ? cov_msg.odom.header.stamp : cloud_msg.header.stamp;
+
+  const bool cloud_in_reference =
+      params_.io.cloud_already_in_reference_frame ||
+      cloud_msg.header.frame_id == params_.io.reference_frame;
+  if (!cloud_in_reference) {
+    cloud = TransformCloud(cloud, T_RL);
+  }
+  frame.cloud = cloud;
+  return frame;
+}
+
+void DeformMonitorV3Node::InitializeReferenceIfNeeded(const FrameInput& frame) {
+  if (reference_ready_) {
+    return;
+  }
+
+  reference_observation_stats_.AddFrame(frame.cloud, frame.stamp);
+
+  ReferenceInitFrame init_frame;
+  init_frame.cloud.reset(new pcl::PointCloud<pcl::PointXYZI>(*frame.cloud));
+  init_frame.lidar_origin_R = frame.lidar_origin_R;
+  init_frame.pose_cov = frame.pose_cov;
+  init_frame.stamp = frame.stamp;
+  init_frames_.push_back(std::move(init_frame));
+  ++init_frame_count_;
+
+  if (init_frame_count_ < params_.reference.init_frames) {
+    return;
+  }
+
+  anchors_ = anchor_builder_.BuildFrozenAnchors(init_frames_);
+  ApplyDeterministicAnchorKeepRatio(params_.runtime_scaling.anchor_keep_ratio,
+                                    &anchors_);
+  for (auto& anchor : anchors_) {
+    anchor.reference_epoch = reference_epoch_id_;
+    anchor.reference_stamp = frame.stamp;
+    anchor.reference_origin = AnchorReferenceOrigin::INITIAL;
+  }
+  BuildReferenceAdjacency();
+  anchor_states_.clear();
+  anchor_states_.reserve(anchors_.size());
+  for (const auto& anchor : anchors_) {
+    AnchorTrackState state;
+    state.id = anchor.id;
+    state.type = anchor.type;
+    state.last_update = frame.stamp;
+    imm_filter_.InitializeAnchorState(&state);
+    anchor_states_.push_back(state);
+  }
+  observations_.resize(anchors_.size());
+  reference_ready_ = !anchors_.empty();
+  if (reference_ready_) {
+    ObservationFrameDeque risk_reference_frames;
+    for (const auto& source : init_frames_) {
+      ObservationFrame converted;
+      converted.cloud = source.cloud;
+      converted.pose_cov = source.pose_cov;
+      converted.lidar_origin_R = source.lidar_origin_R;
+      converted.stamp = source.stamp;
+      risk_reference_frames.push_back(converted);
+    }
+    risk_map_pipeline_.BuildReference(risk_reference_frames, reference_epoch_id_);
+    reference_initialized_stamp_ = frame.stamp;
+    detection_time_base_stamp_ = frame.stamp;
+    last_detection_stamp_ = frame.stamp;
+  } else {
+    reference_initialized_stamp_ = ros::Time();
+    detection_time_base_stamp_ = ros::Time();
+    last_detection_stamp_ = ros::Time();
+  }
+  init_frames_.clear();
+  temporal_window_frames_.clear();
+  frames_since_last_window_process_ = 0;
+
+  if (reference_ready_) {
+    PublishObjectObservationStats(reference_observation_stats_.BuildSummary(
+        reference_epoch_id_, ObjectObservationPhase::REFERENCE));
+    reference_observation_stats_.Reset();
+    
+    
+    
+    if (params_.structure_tracker.enable) {
+      StructureUnitBuilder su_builder(params_.structure_unit);
+      structure_units_ = su_builder.Build(anchors_);
+      structure_unit_tracker_ = std::make_unique<StructureUnitTracker>(
+          params_.structure_tracker, structure_units_);
+      ROS_INFO("[deform_monitor_v3] 结构单元构建完成，共 %zu 个单元",
+               structure_units_.size());
+    } else {
+      structure_units_.clear();
+      structure_unit_tracker_.reset();
+    }
+    std::cout << "[微动监测V3] 参考初始化完成, 锚单元数=" << anchors_.size()
+              << " 累积帧数=" << init_frame_count_ << std::endl;
+    if (diagnostics_log_.is_open()) {
+      diagnostics_log_ << "[REFERENCE] stamp=" << frame.stamp.toSec()
+                       << " reference_epoch=" << reference_epoch_id_
+                       << " reference_initialized_at="
+                       << reference_initialized_stamp_.toSec()
+                       << " anchors=" << anchors_.size()
+                       << " init_frames=" << init_frame_count_ << std::endl;
+      diagnostics_log_.flush();
+    }
+  } else {
+    std::cout << "[微动监测V3] 参考初始化失败: 锚单元数=0"
+              << " 累积帧数=" << init_frame_count_
+              << "，当前不会发布任何 RViz 可视化结果" << std::endl;
+    if (diagnostics_log_.is_open()) {
+      diagnostics_log_ << "[REFERENCE] stamp=" << frame.stamp.toSec()
+                       << " reference_epoch=" << reference_epoch_id_
+                       << " anchors=0"
+                       << " init_frames=" << init_frame_count_
+                       << " status=failed" << std::endl;
+      diagnostics_log_.flush();
+    }
+  }
+}
+
+bool DeformMonitorV3Node::JudgeAnchorSignificance(const AnchorReference& anchor,
+                                                  AnchorTrackState* state) const {
+  if (!state) {
+    return false;
+  }
+  bool displacement_sig = false;
+  if (state->gate_state == ObsGateState::OBSERVABLE_MATCHED && state->comparable &&
+      state->dof_obs > 0) {
+    const ObservableSubspace subspace = BuildObservableSubspace(anchor);
+    const int dof_eff = std::min(state->dof_obs, subspace.rank);
+    if (dof_eff > 0) {
+      const double chi2_threshold = Chi2ThresholdByDof(dof_eff, params_.significance.alpha_s);
+      const bool stat_sig = state->chi2_stat > chi2_threshold;
+      const bool amp_sig =
+          state->type == AnchorType::PLANE
+              ? state->disp_normal > params_.significance.tau_A_normal
+              : (state->disp_norm > params_.significance.tau_A_norm ||
+                 state->disp_normal > params_.significance.tau_A_normal ||
+                 state->disp_edge > params_.significance.tau_A_edge);
+      displacement_sig = stat_sig && amp_sig;
+    }
+  }
+
+  if (params_.local_contrast.enable) {
+    const bool enough_bg =
+        state->local_bg_count >= std::max(1, params_.local_contrast.min_neighbors);
+    const bool rel_amp_sig =
+        state->type == AnchorType::PLANE
+            ? (state->local_rel_normal > params_.local_contrast.tau_rel_normal ||
+               state->local_rel_norm > params_.local_contrast.tau_rel_norm)
+            : (state->local_rel_norm > params_.local_contrast.tau_rel_norm ||
+               state->local_rel_normal > params_.local_contrast.tau_rel_normal ||
+               state->local_rel_edge > params_.local_contrast.tau_rel_edge);
+    const bool contrast_sig =
+        enough_bg &&
+        state->local_contrast_score > params_.local_contrast.tau_contrast_score;
+    bool plane_bg_sig = false;
+    if (params_.local_contrast.enable_plane_background_for_edges &&
+        state->type != AnchorType::PLANE) {
+      const bool enough_plane_bg =
+          state->plane_bg_count >= std::max(1, params_.local_contrast.min_plane_neighbors);
+      const bool plane_rel_amp_sig =
+          state->plane_rel_norm > params_.local_contrast.tau_rel_norm ||
+          state->plane_rel_normal > params_.local_contrast.tau_rel_normal ||
+          state->plane_rel_edge > params_.local_contrast.tau_rel_edge;
+      const bool plane_contrast_sig =
+          enough_plane_bg &&
+          state->plane_contrast_score > params_.local_contrast.tau_plane_contrast_score;
+      plane_bg_sig = enough_plane_bg && plane_rel_amp_sig && plane_contrast_sig;
+    }
+    
+    
+    if (state->type != AnchorType::PLANE) {
+      displacement_sig = displacement_sig && ((rel_amp_sig && contrast_sig) || plane_bg_sig);
+    }
+  }
+
+  const bool graph_motion_sig =
+      state->graph_candidate &&
+      state->graph_neighbor_count >= std::max(1, params_.graph_temporal.min_neighbors) &&
+      state->graph_coherent_score > params_.graph_temporal.tau_graph_support &&
+      state->graph_temporal_score > params_.graph_temporal.tau_graph_temporal;
+  state->persistent_candidate =
+      state->cusum_score > params_.significance.cusum_h ||
+      state->graph_persistence_score > params_.graph_temporal.cusum_h ||
+      state->directional_persistent;  
+  if (state->type == AnchorType::PLANE) {
+    state->disappearance_candidate = false;
+  }
+  
+  
+  
+  if (state->type == AnchorType::PLANE && state->reacquired &&
+      (state->matched_center_R - anchor.center_R).norm() > 0.30) {
+    displacement_sig = false;
+  }
+  
+  
+  const bool is_isolated_reacquired =
+      state->reacquired &&
+      state->local_bg_count == 0 &&
+      state->graph_neighbor_count == 0;
+  if (params_.directional_motion.enable &&
+      is_isolated_reacquired &&
+      !state->directional_persistent) {
+    displacement_sig = false;
+  }
+  if (state->weak_plane_candidate) {
+    state->persistent_candidate = true;
+    state->mode = DetectionMode::DISPLACEMENT;
+    return true;
+  }
+  if (displacement_sig && (state->persistent_candidate || graph_motion_sig)) {
+    state->mode = DetectionMode::DISPLACEMENT;
+  } else {
+    state->mode = DetectionMode::NONE;
+  }
+  return displacement_sig && (state->persistent_candidate || graph_motion_sig);
+}
+
+void DeformMonitorV3Node::ProcessFrame(const FrameInput& frame) {
+  ObservationFrameDeque single_frame_window;
+  single_frame_window.push_back(frame);
+  ProcessFrameWindow(single_frame_window);
+}
+
+void DeformMonitorV3Node::ProcessFrameWindow(const ObservationFrameDeque& frames) {
+  if (frames.empty()) {
+    return;
+  }
+
+  const FrameInput& frame = frames.back();
+  const ros::Time stamp = frames.back().stamp;
+  StageRuntimeRecord runtime_record;
+  runtime_record.stamp = stamp;
+  runtime_record.frame_index = runtime_frame_index_++;
+  runtime_record.reference_epoch = reference_epoch_id_;
+  runtime_record.input_frame_count = frames.size();
+  runtime_record.input_point_counts_by_frame.reserve(frames.size());
+  for (const auto& input_frame : frames) {
+    if (input_frame.cloud) {
+      const uint64_t point_count = input_frame.cloud->size();
+      runtime_record.input_point_count += point_count;
+      runtime_record.input_point_counts_by_frame.push_back(point_count);
+    } else {
+      runtime_record.input_point_counts_by_frame.push_back(0);
+    }
+  }
+  runtime_record.anchor_count = anchors_.size();
+  size_t comparable_count = 0;
+  size_t significant_count = 0;
+
+  {
+    ScopedWallTimer total_timer(&runtime_record.total_ms);
+
+    const bool use_temporal_window = params_.temporal.enable && frames.size() > 1;
+    observations_.assign(anchors_.size(), CurrentObservation());
+    {
+      ScopedWallTimer stage_a_timer(&runtime_record.stage_a_ms);
+      {
+        ScopedWallTimer stage_a_prepare_timer(&runtime_record.stage_a_prepare_ms);
+        if (use_temporal_window) {
+          obs_extractor_.PrepareTemporalWindow(frames);
+        } else {
+          obs_extractor_.PrepareSingleFrame(frame.cloud, frame.pose_cov, frame.lidar_origin_R);
+        }
+      }
+      {
+        ScopedWallTimer stage_a_extract_timer(&runtime_record.stage_a_extract_ms);
+        ParallelFor(anchors_.size(), [this, &frame](size_t i) {
+          const Eigen::Vector3d predicted_displacement_R =
+              anchor_states_[i].x_mix.block<3, 1>(0, 0);
+          observations_[i] =
+              obs_extractor_.ExtractForAnchorFromPreparedCache(anchors_[i],
+                                                               frame.pose_cov,
+                                                               frame.lidar_origin_R,
+                                                               predicted_displacement_R);
+        });
+      }
+    }
+
+    // Probabilistic risk path consumes per-frame raw scalar residuals before
+    // background-bias correction and before the current IMM update. This keeps
+    // the evidence block causal and preserves the actual missing-channel mask.
+    if (risk_map_params_.enable) {
+      std::vector<CurrentObservationVector> risk_observations_by_frame;
+      risk_observations_by_frame.reserve(frames.size());
+      for (const auto& risk_frame : frames) {
+        // The scalar variance is the independent D term. Pose uncertainty is
+        // deliberately removed here and reintroduced once, as the shared
+        // G K_xi G^T term in DeformationEvidence.
+        PoseCov6D independent_pose = risk_frame.pose_cov;
+        independent_pose.Sigma_xi.setZero();
+        risk_obs_extractor_.PrepareSingleFrame(risk_frame.cloud,
+                                               independent_pose,
+                                               risk_frame.lidar_origin_R);
+        CurrentObservationVector frame_observations(anchors_.size());
+        ParallelFor(anchors_.size(), [this, &risk_frame, &independent_pose,
+                                      &frame_observations](size_t i) {
+          const Eigen::Vector3d frozen_prediction = anchor_states_[i].x_mix.head<3>();
+          frame_observations[i] = risk_obs_extractor_.ExtractForAnchorFromPreparedCache(
+              anchors_[i], independent_pose, risk_frame.lidar_origin_R, frozen_prediction);
+        });
+        risk_observations_by_frame.push_back(std::move(frame_observations));
+      }
+      probabilistic_risk_frame_valid_ = risk_map_pipeline_.Process(
+          frames, risk_observations_by_frame, anchors_, anchor_states_,
+          reference_epoch_id_, &probabilistic_risk_frame_);
+      if (probabilistic_risk_frame_valid_) {
+        probabilistic_risk_frame_.world_frame = params_.io.reference_frame;
+        probabilistic_risk_frame_.dropped_frame_count = risk_map_exporter_.dropped();
+        probabilistic_risk_map_pub_.publish(
+            risk_map::BuildRiskMapMessage(probabilistic_risk_frame_));
+        probabilistic_risk_regions_pub_.publish(
+            risk_map::BuildRiskRegionsMessage(probabilistic_risk_frame_));
+        risk_map_exporter_.Enqueue(probabilistic_risk_frame_);
+      }
+    }
+
+    {
+      ScopedWallTimer stage_d_timer(&runtime_record.stage_d_ms);
+      ScopedWallTimer stage_d_bias_timer(&runtime_record.stage_d_bias_ms);
+      last_background_bias_R_.setZero();
+      last_background_bias_anchor_count_ = 0;
+      last_background_bias_scalar_count_ = 0;
+      drift_estimation_degraded_ = false;
+      if (params_.background_bias.enable) {
+        Eigen::Vector3d bias_R = Eigen::Vector3d::Zero();
+        size_t used_anchor_count = 0;
+        size_t used_scalar_count = 0;
+        size_t total_comparable_plane = 0;
+        if (EstimateBackgroundBias(observations_, &bias_R, &used_anchor_count,
+                                   &used_scalar_count, &total_comparable_plane)) {
+          const double stable_ratio = (total_comparable_plane > 0)
+              ? static_cast<double>(used_anchor_count) / total_comparable_plane
+              : 0.0;
+          if (stable_ratio < params_.background_bias.min_stable_ratio &&
+              has_previous_bias_) {
+            drift_estimation_degraded_ = true;
+            bias_R = smoothed_background_bias_R_;
+          } else {
+            if (has_previous_bias_) {
+              const double alpha = params_.background_bias.ema_alpha;
+              bias_R = alpha * bias_R + (1.0 - alpha) * smoothed_background_bias_R_;
+            }
+            smoothed_background_bias_R_ = bias_R;
+            has_previous_bias_ = true;
+          }
+
+          ApplyBackgroundBias(bias_R, &observations_);
+          last_background_bias_R_ = bias_R;
+          last_background_bias_anchor_count_ = used_anchor_count;
+          last_background_bias_scalar_count_ = used_scalar_count;
+        } else if (has_previous_bias_) {
+          drift_estimation_degraded_ = true;
+          ApplyBackgroundBias(smoothed_background_bias_R_, &observations_);
+          last_background_bias_R_ = smoothed_background_bias_R_;
+        }
+      }
+    }
+
+    {
+      ScopedWallTimer stage_b_timer(&runtime_record.stage_b_ms);
+      {
+        ScopedWallTimer stage_b_predict_timer(&runtime_record.stage_b_predict_ms);
+        ParallelFor(anchor_states_.size(), [this, &stamp](size_t i) {
+          double dt = (stamp - anchor_states_[i].last_update).toSec();
+          if (dt <= 0.0 || !std::isfinite(dt)) {
+            dt = 0.1;
+          }
+          anchor_states_[i].cluster_member = false;
+          imm_filter_.Predict(&anchor_states_[i], dt);
+        });
+      }
+      {
+        ScopedWallTimer stage_b_update_timer(&runtime_record.stage_b_update_ms);
+        ParallelFor(anchor_states_.size(), [this](size_t i) {
+          imm_filter_.Update(&anchor_states_[i], anchors_[i], observations_[i]);
+        });
+      }
+      {
+        ScopedWallTimer stage_b_statistics_timer(&runtime_record.stage_b_statistics_ms);
+        ParallelFor(anchor_states_.size(), [this](size_t i) {
+          const Eigen::Vector3d u = anchor_states_[i].x_mix.block<3, 1>(0, 0);
+          const Eigen::Matrix3d Su = anchor_states_[i].P_mix.block<3, 3>(0, 0);
+          const ObservableSubspace subspace = BuildObservableSubspace(anchors_[i]);
+          const Eigen::Vector3d observable_u = ProjectObservableVector(
+              u, subspace, anchor_states_[i].dof_obs);
+          anchor_states_[i].disp_norm = observable_u.norm();
+          anchor_states_[i].disp_normal =
+              std::abs(subspace.basis_R.col(0).dot(observable_u));
+          anchor_states_[i].disp_edge =
+              subspace.rank > 1
+                  ? std::abs(subspace.basis_R.col(1).dot(observable_u))
+                  : 0.0;
+          anchor_states_[i].chi2_stat = ProjectedChiSquare(
+              u, Su, subspace, anchor_states_[i].dof_obs);
+          anchor_states_[i].comparable = observations_[i].comparable;
+          anchor_states_[i].observable = observations_[i].observable;
+          anchor_states_[i].gate_state = observations_[i].gate_state;
+          anchor_states_[i].observed_object_id = observations_[i].observed_object_id;
+          anchor_states_[i].observed_object_id_valid =
+              observations_[i].observed_object_id_valid;
+          anchor_states_[i].observed_object_id_confidence =
+              observations_[i].observed_object_id_confidence;
+          anchor_states_[i].observed_object_id_support_count =
+              observations_[i].observed_object_id_support_count;
+          anchor_states_[i].object_association_state =
+              observations_[i].object_association_state;
+          anchor_states_[i].reacquired = observations_[i].reacquired;
+          anchor_states_[i].matched_center_R = observations_[i].matched_center_R;
+        });
+      }
+    }
+
+    {
+      ScopedWallTimer stage_c_timer(&runtime_record.stage_c_ms);
+      {
+        ScopedWallTimer stage_c_cusum_timer(&runtime_record.stage_c_cusum_ms);
+        ParallelFor(anchor_states_.size(), [this, &stamp](size_t i) {
+          double dt = (stamp - anchor_states_[i].last_update).toSec();
+          if (dt <= 0.0 || !std::isfinite(dt)) {
+            dt = 0.1;
+          }
+          imm_filter_.UpdateCusum(&anchor_states_[i]);
+          imm_filter_.UpdateDirectionalMotion(&anchor_states_[i], anchors_[i],
+                                              observations_[i].cmp_score, dt);
+
+          if ((observations_[i].gate_state == ObsGateState::OBSERVABLE_MISSING ||
+               observations_[i].gate_state == ObsGateState::OBSERVABLE_REPLACED) &&
+              observations_[i].disappearance_score >= params_.significance.tau_disappear) {
+            ++anchor_states_[i].disappearance_streak;
+            anchor_states_[i].disappearance_score =
+                std::max(observations_[i].disappearance_score,
+                         0.70 * anchor_states_[i].disappearance_score +
+                             0.30 * observations_[i].disappearance_score);
+          } else {
+            anchor_states_[i].disappearance_streak = 0;
+            const double decay =
+                observations_[i].gate_state == ObsGateState::NOT_OBSERVABLE ? 0.60 : 0.80;
+            anchor_states_[i].disappearance_score *= decay;
+            if (anchor_states_[i].disappearance_score < 0.05) {
+              anchor_states_[i].disappearance_score = 0.0;
+            }
+          }
+          anchor_states_[i].disappearance_candidate =
+              anchor_states_[i].disappearance_streak >= params_.significance.disappear_frames &&
+              anchor_states_[i].disappearance_score >= params_.significance.tau_disappear;
+          anchor_states_[i].last_update = stamp;
+        });
+      }
+
+      {
+        ScopedWallTimer stage_c_local_contrast_timer(&runtime_record.stage_c_local_contrast_ms);
+        UpdateLocalContrastStates();
+      }
+      {
+        ScopedWallTimer stage_c_graph_temporal_timer(&runtime_record.stage_c_graph_temporal_ms);
+        UpdateGraphTemporalStates(stamp);
+      }
+      {
+        ScopedWallTimer stage_c_weak_plane_timer(&runtime_record.stage_c_weak_plane_ms);
+        weak_plane_motion_detector_.Update(anchors_, &anchor_states_);
+      }
+
+      {
+        ScopedWallTimer stage_c_significance_timer(&runtime_record.stage_c_significance_ms);
+        for (size_t i = 0; i < anchor_states_.size(); ++i) {
+          anchor_states_[i].significant = JudgeAnchorSignificance(anchors_[i], &anchor_states_[i]);
+          const double evidence = anchor_states_[i].mode == DetectionMode::DISAPPEARANCE
+                                      ? anchor_states_[i].disappearance_score
+                                      : anchor_states_[i].cusum_score;
+          anchor_states_[i].evidence_history.push_back(evidence);
+          while (anchor_states_[i].evidence_history.size() > 20) {
+            anchor_states_[i].evidence_history.pop_front();
+          }
+
+          if (anchor_states_[i].comparable) {
+            ++comparable_count;
+          }
+          if (anchor_states_[i].significant || anchor_states_[i].disappearance_candidate) {
+            ++significant_count;
+          }
+        }
+      }
+    }
+
+    {
+      ScopedWallTimer stage_d_timer(&runtime_record.stage_d_ms);
+      {
+        ScopedWallTimer stage_d_cluster_timer(&runtime_record.stage_d_cluster_ms);
+        clusters_ = clusterer_.Cluster(anchors_, anchor_states_);
+        // Was an O(cluster_count * cluster_member_count * anchor_count) linear
+        // scan of anchor_states_ per cluster member (this run's ~7.6k anchors
+        // made this the single worst-scaling piece of Stage D). Build the
+        // id->index map once per cycle instead -- same "first match wins"
+        // semantics as the old inner-loop break (anchor ids are unique), just
+        // O(anchor_count) to build + O(1) average lookup per member instead of
+        // O(anchor_count) per member.
+        std::unordered_map<int, size_t> anchor_id_to_index;
+        anchor_id_to_index.reserve(anchor_states_.size());
+        for (size_t i = 0; i < anchor_states_.size(); ++i) {
+          anchor_id_to_index.emplace(anchor_states_[i].id, i);
+        }
+        for (const auto& cluster : clusters_) {
+          if (!cluster.significant) {
+            continue;
+          }
+          for (const int anchor_id : cluster.anchor_ids) {
+            const auto it = anchor_id_to_index.find(anchor_id);
+            if (it != anchor_id_to_index.end()) {
+              anchor_states_[it->second].cluster_member = true;
+            }
+          }
+        }
+      }
+
+      {
+        ScopedWallTimer stage_d_structure_timer(&runtime_record.stage_d_structure_ms);
+        old_regions_.clear();
+        new_regions_.clear();
+        structure_motions_.clear();
+        if (params_.structure_correspondence.enable) {
+          region_hypothesis_builder_.Build(anchors_,
+                                           anchor_states_,
+                                           observations_,
+                                           clusters_,
+                                           &old_regions_,
+                                           &new_regions_);
+          structure_motions_ =
+              region_correspondence_solver_.Solve(old_regions_, new_regions_);
+        }
+      }
+
+      {
+        ScopedWallTimer stage_d_risk_timer(&runtime_record.stage_d_risk_ms);
+        risk_evidence_.clear();
+        risk_voxels_.clear();
+        risk_regions_.clear();
+        if (params_.risk_visualization.enable || params_.persistent_risk.enable) {
+          risk_evidence_ = risk_adapter_.Build(anchors_, anchor_states_, observations_, clusters_);
+          risk_voxels_ = risk_field_builder_.Build(anchors_, risk_evidence_);
+          risk_regions_ = risk_field_builder_.ExtractRegions(risk_voxels_);
+        }
+      }
+
+      {
+        ScopedWallTimer stage_d_persistent_track_timer(&runtime_record.stage_d_persistent_track_ms);
+        if (params_.persistent_risk.enable) {
+          persistent_risk_tracks_ = persistent_risk_tracker_.Update(risk_regions_, stamp);
+        } else {
+          persistent_risk_tracks_.clear();
+        }
+      }
+
+      {
+        ScopedWallTimer stage_d_ref_stats_timer(&runtime_record.stage_d_ref_stats_ms);
+        ref_manager_.UpdateReferenceStatistics(&anchors_, observations_, &anchor_states_);
+      }
+
+      {
+        ScopedWallTimer stage_d_structure_unit_timer(&runtime_record.stage_d_structure_unit_ms);
+        if (structure_unit_tracker_) {
+          pcl::PointCloud<pcl::PointXYZ> cloud_xyz;
+          for (const auto& f : frames) {
+            if (!f.cloud) {
+              continue;
+            }
+            pcl::PointCloud<pcl::PointXYZ> tmp;
+            pcl::copyPointCloud(*f.cloud, tmp);
+            cloud_xyz += tmp;
+          }
+          structure_unit_tracker_->Update(cloud_xyz, anchor_states_, structure_migrations_);
+        }
+      }
+
+      {
+        ScopedWallTimer stage_d_incremental_timer(&runtime_record.stage_d_incremental_ms);
+        TryIncrementalAnchorPromotion(frames);
+      }
+
+      {
+        ScopedWallTimer stage_d_publish_timer(&runtime_record.stage_d_publish_ms);
+        PublishResults(stamp);
+      }
+    }
+
+    WriteFrameDiagnostics(stamp, comparable_count, significant_count, clusters_.size());
+  }
+
+  runtime_record.anchor_count = anchors_.size();
+  runtime_record.comparable_anchor_count = comparable_count;
+  runtime_record.significant_anchor_count = significant_count;
+  runtime_record.cluster_count = clusters_.size();
+  runtime_record.risk_evidence_count = risk_evidence_.size();
+  runtime_record.risk_voxel_count = risk_voxels_.size();
+  runtime_record.risk_region_count = risk_regions_.size();
+  runtime_record.persistent_track_count = persistent_risk_tracks_.size();
+  ObjectObservationStatsAccumulator monitoring_stats;
+  monitoring_stats.SetParams(params_.object_association);
+  for (const auto& input_frame : frames) {
+    monitoring_stats.AddFrame(input_frame.cloud, input_frame.stamp);
+  }
+  PublishObjectObservationStats(monitoring_stats.BuildSummary(
+      reference_epoch_id_, ObjectObservationPhase::MONITORING));
+  WriteStageRuntimeRecord(runtime_record);
+  PrintFrameSummary(stamp, comparable_count, significant_count, clusters_.size(),
+                    runtime_record.total_ms);
+}
+
+void DeformMonitorV3Node::TryIncrementalAnchorPromotion(
+    const ObservationFrameDeque& frames) {
+  if (!params_.incremental.enable || !reference_ready_ || frames.empty()) {
+    return;
+  }
+
+  
+  const auto& last_frame = frames.back();
+  ReferenceInitFrame init_frame;
+  init_frame.cloud.reset(new pcl::PointCloud<pcl::PointXYZI>(*last_frame.cloud));
+  init_frame.lidar_origin_R = last_frame.lidar_origin_R;
+  init_frame.pose_cov = last_frame.pose_cov;
+  init_frame.stamp = last_frame.stamp;
+  incremental_init_frames_.push_back(std::move(init_frame));
+  ++incremental_frame_count_;
+
+  
+  if (incremental_frame_count_ < params_.incremental.warmup_frames) {
+    return;
+  }
+
+  
+  int start_id = 0;
+  for (const auto& anchor : anchors_) {
+    start_id = std::max(start_id, anchor.id + 1);
+  }
+
+  AnchorReferenceVector new_anchors = anchor_builder_.BuildIncrementalAnchors(
+      incremental_init_frames_,
+      anchors_,
+      params_.incremental.coverage_radius,
+      start_id,
+      params_.incremental.min_visible_frames,
+      params_.incremental.max_new_anchors);
+
+  
+  incremental_init_frames_.clear();
+  incremental_frame_count_ = 0;
+
+  if (new_anchors.empty()) {
+    return;
+  }
+
+  const ros::Time stamp = frames.back().stamp;
+  for (auto& anchor : new_anchors) {
+    anchor.reference_epoch = reference_epoch_id_;
+    anchor.reference_stamp = stamp;
+    anchor.reference_origin = AnchorReferenceOrigin::INCREMENTAL;
+  }
+
+  
+  const size_t old_size = anchors_.size();
+  for (auto& anchor : new_anchors) {
+    anchors_.push_back(std::move(anchor));
+  }
+
+  
+  for (size_t i = old_size; i < anchors_.size(); ++i) {
+    AnchorTrackState state;
+    state.id = anchors_[i].id;
+    state.type = anchors_[i].type;
+    state.last_update = stamp;
+    imm_filter_.InitializeAnchorState(&state);
+    anchor_states_.push_back(state);
+  }
+
+  
+  observations_.resize(anchors_.size());
+
+  
+  BuildReferenceAdjacency();
+
+  std::cout << "[微动监测V3] 增量锚点晋升: 新增=" << new_anchors.size()
+            << " 总锚点=" << anchors_.size() << std::endl;
+  if (diagnostics_log_.is_open()) {
+    diagnostics_log_ << "[INCREMENTAL] stamp=" << stamp.toSec()
+                     << " reference_epoch=" << reference_epoch_id_
+                     << " new_anchors=" << new_anchors.size()
+                     << " total_anchors=" << anchors_.size() << std::endl;
+    diagnostics_log_.flush();
+  }
+}
+
+void DeformMonitorV3Node::PublishResults(const ros::Time& stamp) {
+  anchors_pub_.publish(
+      viz_publisher_.BuildAnchorStatesMsg(anchors_, anchor_states_, observations_, stamp,
+                                          params_.io.reference_frame,
+                                          reference_epoch_id_,
+                                          reference_initialized_stamp_));
+  clusters_pub_.publish(
+      viz_publisher_.BuildMotionClustersMsg(clusters_, stamp, params_.io.reference_frame));
+  debug_cloud_pub_.publish(
+      viz_publisher_.BuildDebugCloudMsg(anchors_, anchor_states_, stamp,
+                                        params_.io.reference_frame));
+  anchor_markers_pub_.publish(
+      viz_publisher_.BuildAnchorMarkers(anchors_, anchor_states_, stamp, params_.io.reference_frame));
+  motion_markers_pub_.publish(viz_publisher_.BuildMotionMarkers(
+      anchors_, anchor_states_, clusters_, stamp, params_.io.reference_frame));
+  if (params_.structure_correspondence.enable) {
+    if (params_.structure_correspondence.publish_motions) {
+      structure_motions_pub_.publish(structure_viz_publisher_.BuildStructureMotionsMsg(
+          structure_motions_, stamp, params_.io.reference_frame));
+    }
+    if (params_.structure_correspondence.publish_markers) {
+      structure_markers_pub_.publish(
+          structure_viz_publisher_.BuildMarkers(structure_motions_, stamp,
+                                                params_.io.reference_frame));
+    }
+  }
+  
+  viz_publisher_.PublishStructureMigrations(
+      structure_units_, structure_migrations_, stamp, params_.io.reference_frame);
+  if (params_.risk_visualization.enable) {
+    if (params_.risk_visualization.publish_evidence) {
+      risk_evidence_pub_.publish(
+          risk_viz_publisher_.BuildRiskEvidenceMsg(risk_evidence_, stamp,
+                                                   params_.io.reference_frame));
+    }
+    if (params_.risk_visualization.publish_voxels) {
+      risk_voxels_pub_.publish(
+          risk_viz_publisher_.BuildRiskVoxelFieldMsg(risk_voxels_, stamp,
+                                                     params_.io.reference_frame));
+    }
+    if (params_.risk_visualization.publish_regions) {
+      risk_regions_pub_.publish(
+          risk_viz_publisher_.BuildRiskRegionsMsg(risk_regions_, stamp,
+                                                  params_.io.reference_frame));
+    }
+    if (params_.risk_visualization.publish_markers) {
+      risk_markers_pub_.publish(
+          risk_viz_publisher_.BuildRiskMarkers(risk_voxels_, risk_regions_, stamp,
+                                               params_.io.reference_frame));
+    }
+  }
+  if (params_.persistent_risk.enable) {
+    persistent_risk_regions_pub_.publish(
+        risk_viz_publisher_.BuildPersistentRiskRegionsMsg(persistent_risk_tracks_, stamp,
+                                                          params_.io.reference_frame,
+                                                          reference_epoch_id_));
+    persistent_risk_markers_pub_.publish(
+        risk_viz_publisher_.BuildPersistentRiskMarkers(persistent_risk_tracks_, stamp,
+                                                       params_.io.reference_frame));
+  }
+}
+
+void DeformMonitorV3Node::PublishObjectObservationStats(
+    const ObjectObservationStatsState& summary) {
+  deform_monitor_v3::ObjectObservationStats msg;
+  msg.header.stamp = summary.window_end;
+  msg.header.frame_id = params_.io.reference_frame;
+  msg.phase = static_cast<uint8_t>(summary.phase);
+  msg.reference_epoch = summary.reference_epoch;
+  msg.window_start = summary.window_start;
+  msg.window_end = summary.window_end;
+  msg.frame_count = summary.frame_count;
+  msg.total_point_count = summary.total_point_count;
+  msg.valid_label_point_count = summary.valid_label_point_count;
+  msg.invalid_label_point_count = summary.invalid_label_point_count;
+  msg.objects.reserve(summary.objects.size());
+  for (const auto& object : summary.objects) {
+    deform_monitor_v3::ObjectHitStat hit;
+    hit.object_id = object.object_id;
+    hit.point_count = object.point_count;
+    hit.visible_frame_count = object.visible_frame_count;
+    msg.objects.push_back(hit);
+  }
+  object_observation_stats_pub_.publish(msg);
+}
+
+void DeformMonitorV3Node::PublishEmptyResults(const ros::Time& stamp) {
+  AnchorReferenceVector empty_anchors;
+  AnchorStateVector empty_states;
+  CurrentObservationVector empty_observations;
+  MotionClusterVector empty_clusters;
+  StructureMotionVector empty_structure_motions;
+  RiskEvidenceVector empty_evidence;
+  RiskVoxelVector empty_voxels;
+  RiskRegionVector empty_regions;
+  PersistentRiskTrackVector empty_persistent_tracks;
+  anchors_pub_.publish(viz_publisher_.BuildAnchorStatesMsg(empty_anchors,
+                                                           empty_states,
+                                                           empty_observations,
+                                                           stamp,
+                                                           params_.io.reference_frame,
+                                                           reference_epoch_id_,
+                                                           reference_initialized_stamp_));
+  clusters_pub_.publish(
+      viz_publisher_.BuildMotionClustersMsg(empty_clusters, stamp, params_.io.reference_frame));
+  debug_cloud_pub_.publish(
+      viz_publisher_.BuildDebugCloudMsg(empty_anchors, empty_states, stamp,
+                                        params_.io.reference_frame));
+  anchor_markers_pub_.publish(viz_publisher_.BuildAnchorMarkers(
+      empty_anchors, empty_states, stamp, params_.io.reference_frame));
+  motion_markers_pub_.publish(viz_publisher_.BuildMotionMarkers(
+      empty_anchors, empty_states, empty_clusters, stamp, params_.io.reference_frame));
+  if (params_.structure_correspondence.enable) {
+    if (params_.structure_correspondence.publish_motions) {
+      structure_motions_pub_.publish(structure_viz_publisher_.BuildStructureMotionsMsg(
+          empty_structure_motions, stamp, params_.io.reference_frame));
+    }
+    if (params_.structure_correspondence.publish_markers) {
+      structure_markers_pub_.publish(
+          structure_viz_publisher_.BuildMarkers(empty_structure_motions, stamp,
+                                                params_.io.reference_frame));
+    }
+  }
+  if (params_.risk_visualization.enable) {
+    if (params_.risk_visualization.publish_evidence) {
+      risk_evidence_pub_.publish(
+          risk_viz_publisher_.BuildRiskEvidenceMsg(empty_evidence, stamp,
+                                                   params_.io.reference_frame));
+    }
+    if (params_.risk_visualization.publish_voxels) {
+      risk_voxels_pub_.publish(
+          risk_viz_publisher_.BuildRiskVoxelFieldMsg(empty_voxels, stamp,
+                                                     params_.io.reference_frame));
+    }
+    if (params_.risk_visualization.publish_regions) {
+      risk_regions_pub_.publish(
+          risk_viz_publisher_.BuildRiskRegionsMsg(empty_regions, stamp,
+                                                  params_.io.reference_frame));
+    }
+    if (params_.risk_visualization.publish_markers) {
+      risk_markers_pub_.publish(
+          risk_viz_publisher_.BuildRiskMarkers(empty_voxels, empty_regions, stamp,
+                                               params_.io.reference_frame));
+    }
+  }
+  if (params_.persistent_risk.enable) {
+    persistent_risk_regions_pub_.publish(risk_viz_publisher_.BuildPersistentRiskRegionsMsg(
+        empty_persistent_tracks, stamp, params_.io.reference_frame, reference_epoch_id_));
+    persistent_risk_markers_pub_.publish(risk_viz_publisher_.BuildPersistentRiskMarkers(
+        empty_persistent_tracks, stamp, params_.io.reference_frame));
+  }
+}
+
+void DeformMonitorV3Node::PrintStartupSummary() const {
+  std::cout << "[微动监测V3] 节点启动" << std::endl;
+  std::cout << "  输入点云: " << params_.io.cloud_topic << std::endl;
+  std::cout << "  输入完整位姿协方差: " << params_.io.covariance_topic << std::endl;
+  std::cout << "  手动重置静态参考: " << params_.io.reset_reference_topic << std::endl;
+  std::cout << "  参考坐标系: " << params_.io.reference_frame << std::endl;
+  std::cout << "  参考初始化帧数: " << params_.reference.init_frames << std::endl;
+  std::cout << "  云已在参考系: " << (params_.io.cloud_already_in_reference_frame ? "是" : "否")
+            << std::endl;
+  std::cout << "  当前观测时序融合: "
+            << (params_.temporal.enable ? "启用" : "关闭")
+            << " 窗口=" << params_.temporal.window_frames
+            << "帧 步长=" << params_.temporal.step_frames
+            << "帧" << std::endl;
+  std::cout << "  Ablation variant: " << params_.ablation.variant << std::endl;
+  std::cout << "  Stage-B IMM竞争: "
+            << (params_.imm.enable_model_competition ? "启用" : "关闭")
+            << " 类型约束: " << (params_.imm.enable_type_constraint ? "启用" : "关闭")
+            << " 协方差膨胀alpha_xi=" << params_.covariance.alpha_xi << std::endl;
+  std::cout << "  Stage-C CUSUM: "
+            << (params_.significance.enable_cusum ? "启用" : "关闭")
+            << " 方向累积: "
+            << (params_.directional_motion.enable ? "启用" : "关闭") << std::endl;
+  std::cout << "  背景共同偏差扣除: "
+            << (params_.background_bias.enable ? "启用" : "关闭") << std::endl;
+  std::cout << "  局部背景对比判定: "
+            << (params_.local_contrast.enable ? "启用" : "关闭") << std::endl;
+  std::cout << "  锚点图时序一致性: "
+            << (params_.graph_temporal.enable ? "启用" : "关闭") << std::endl;
+  std::cout << "  结构旧/新区域对应: "
+            << (params_.structure_correspondence.enable ? "启用" : "关闭") << std::endl;
+  std::cout << "  模块化风险可视化: "
+            << (params_.risk_visualization.enable ? "启用" : "关闭") << std::endl;
+  std::cout << "  RViz 主要显示: /deform/debug_cloud, /deform/anchor_markers, /deform/motion_markers"
+            << std::endl;
+  if (params_.risk_visualization.enable) {
+    std::cout << "  风险可视化输出: /deform/risk_voxels, /deform/risk_regions, /deform/risk_markers"
+              << std::endl;
+  }
+}
+
+void DeformMonitorV3Node::PrintFrameSummary(const ros::Time& stamp,
+                                            size_t comparable_count,
+                                            size_t significant_count,
+                                            size_t cluster_count,
+                                            double total_ms) {
+  double detection_interval_sec = 0.0;
+  if (!last_detection_stamp_.isZero()) {
+    detection_interval_sec = std::max(0.0, (stamp - last_detection_stamp_).toSec());
+  } else if (!detection_time_base_stamp_.isZero()) {
+    detection_interval_sec =
+        std::max(0.0, (stamp - detection_time_base_stamp_).toSec());
+  }
+  last_detection_stamp_ = stamp;
+
+  const size_t graph_count =
+      static_cast<size_t>(std::count_if(anchor_states_.begin(),
+                                        anchor_states_.end(),
+                                        [](const AnchorTrackState& state) {
+                                          return state.graph_candidate;
+                                        }));
+  std::cout << std::fixed << std::setprecision(3)
+            << "[微动监测V3] dt=" << detection_interval_sec << "s"
+            << " anchors=" << anchors_.size()
+            << " comparable=" << comparable_count
+            << " significant=" << significant_count
+            << " graph=" << graph_count
+            << " clusters=" << cluster_count
+            << " bg_bias=(" << last_background_bias_R_.x()
+            << "," << last_background_bias_R_.y()
+            << "," << last_background_bias_R_.z()
+            << ")"
+            << " bg_used=" << last_background_bias_anchor_count_
+            << "/" << last_background_bias_scalar_count_
+            << std::defaultfloat << std::endl;
+
+  // Print total processing time once per second (~10 frames at 10 Hz)
+  static int print_frame_counter = 0;
+  if (++print_frame_counter >= 10) {
+    print_frame_counter = 0;
+    ROS_INFO("[微动监测V3] total_ms=%.2f", total_ms);
+  }
+}
+
+void DeformMonitorV3Node::WriteFrameDiagnostics(const ros::Time& stamp,
+                                                size_t comparable_count,
+                                                size_t significant_count,
+                                                size_t cluster_count) {
+  if (!diagnostics_log_.is_open()) {
+    return;
+  }
+
+  double detection_interval_sec = 0.0;
+  if (!last_detection_stamp_.isZero()) {
+    detection_interval_sec = std::max(0.0, (stamp - last_detection_stamp_).toSec());
+  } else if (!detection_time_base_stamp_.isZero()) {
+    detection_interval_sec = std::max(0.0, (stamp - detection_time_base_stamp_).toSec());
+  }
+
+  const size_t graph_count =
+      static_cast<size_t>(std::count_if(anchor_states_.begin(),
+                                        anchor_states_.end(),
+                                        [](const AnchorTrackState& state) {
+                                          return state.graph_candidate;
+                                        }));
+
+  std::vector<size_t> isolated_indices;
+  isolated_indices.reserve(anchor_states_.size());
+  for (size_t i = 0; i < anchor_states_.size(); ++i) {
+    const AnchorTrackState& state = anchor_states_[i];
+    const bool alert_plusplus_anchor =
+        state.significant || state.mode == DetectionMode::DISAPPEARANCE;
+    if (alert_plusplus_anchor && !state.cluster_member) {
+      isolated_indices.push_back(i);
+    }
+  }
+
+  diagnostics_log_ << std::fixed << std::setprecision(3)
+                   << "[FRAME] stamp=" << stamp.toSec()
+                   << " dt=" << detection_interval_sec
+                   << " anchors=" << anchors_.size()
+                   << " comparable=" << comparable_count
+                   << " significant=" << significant_count
+                   << " graph=" << graph_count
+                   << " clusters=" << cluster_count
+                   << " isolated_alert_plusplus=" << isolated_indices.size()
+                   << " bg_bias=(" << last_background_bias_R_.x()
+                   << "," << last_background_bias_R_.y()
+                   << "," << last_background_bias_R_.z()
+                   << ")"
+                   << " bg_used=" << last_background_bias_anchor_count_
+                   << "/" << last_background_bias_scalar_count_
+                   << std::endl;
+
+  
+  ++diag_frame_counter_;
+  if (diag_frame_counter_ % 10 == 0) {
+    struct DirEntry { size_t idx; double s_norm; };
+    std::vector<DirEntry> entries;
+    entries.reserve(anchor_states_.size());
+    for (size_t i = 0; i < anchor_states_.size(); ++i) {
+      if (anchor_states_[i].comparable) {
+        entries.push_back({i, anchor_states_[i].directional_S.norm()});
+      }
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const DirEntry& a, const DirEntry& b) { return a.s_norm > b.s_norm; });
+    const size_t top_n = std::min<size_t>(3, entries.size());
+    for (size_t k = 0; k < top_n; ++k) {
+      const size_t i = entries[k].idx;
+      const AnchorTrackState& s = anchor_states_[i];
+      diagnostics_log_ << "  [dir_diag]"
+                       << " id=" << s.id
+                       << " dir_S_norm=" << s.directional_S.norm()
+                       << " dir_quality=" << s.directional_quality_sum
+                       << " dir_ratio=" << (s.directional_magnitude_sum > 1e-9
+                            ? s.directional_S.norm() / s.directional_magnitude_sum : 0.0)
+                       << " dir_persistent=" << (s.directional_persistent ? 1 : 0)
+                       << " disp_norm=" << s.disp_norm
+                       << " cusum=" << s.cusum_score
+                       << std::endl;
+    }
+  }
+
+  std::vector<int> inactive_ids;
+  inactive_ids.reserve(logged_anchor_alert_plusplus_.size());
+  for (const auto& entry : logged_anchor_alert_plusplus_) {
+    inactive_ids.push_back(entry.first);
+  }
+
+  for (const size_t idx : isolated_indices) {
+    const AnchorReference& anchor = anchors_[idx];
+    const AnchorTrackState& state = anchor_states_[idx];
+    const CurrentObservation& obs = observations_[idx];
+    auto inactive_it = std::find(inactive_ids.begin(), inactive_ids.end(), state.id);
+    if (inactive_it != inactive_ids.end()) {
+      inactive_ids.erase(inactive_it);
+    }
+
+    LoggedAnchorAlertPlusPlusState& logged_state = logged_anchor_alert_plusplus_[state.id];
+    const bool state_changed =
+        logged_state.mode != state.mode ||
+        logged_state.gate_state != state.gate_state ||
+        logged_state.significant != state.significant ||
+        logged_state.cluster_member != state.cluster_member ||
+        logged_state.reacquired != state.reacquired;
+    const bool refresh_due =
+        logged_state.last_logged_stamp.isZero() ||
+        (stamp - logged_state.last_logged_stamp).toSec() >= kDiagnosticsAlertPlusPlusRefreshSec;
+    if (!state_changed && !refresh_due) {
+      continue;
+    }
+
+    const Eigen::Vector3d disp = ProjectObservableVector(
+        state.x_mix.block<3, 1>(0, 0),
+        BuildObservableSubspace(anchor),
+        state.dof_obs);
+    diagnostics_log_ << "  [isolated]"
+                     << " id=" << state.id
+                     << " type=" << AnchorTypeToString(anchor.type)
+                     << " mode=" << DetectionModeToString(state.mode)
+                     << " center=" << FormatVec3(anchor.center_R)
+                     << " disp=" << FormatVec3(disp)
+                     << " matched_delta=" << FormatVec3(obs.matched_delta_R)
+                     << " disp_norm=" << state.disp_norm
+                     << " disp_normal=" << state.disp_normal
+                     << " disp_edge=" << state.disp_edge
+                     << " chi2=" << state.chi2_stat
+                     << " cusum=" << state.cusum_score
+                     << " cmp=" << obs.cmp_score
+                     << " overlap=" << obs.overlap_score
+                     << " fit_rmse=" << obs.fit_rmse
+                     << " support=" << obs.support_count
+                     << " dof=" << state.dof_obs
+                     << " status=" << ObsStatusToString(obs.status)
+                     << " gate=" << ObsGateStateToString(state.gate_state)
+                     << " comparable=" << (state.comparable ? 1 : 0)
+                     << " observable=" << (state.observable ? 1 : 0)
+                     << " significant=" << (state.significant ? 1 : 0)
+                     << " persistent=" << (state.persistent_candidate ? 1 : 0)
+                     << " disappearance_candidate=" << (state.disappearance_candidate ? 1 : 0)
+                     << " disappearance_score=" << state.disappearance_score
+                     << " reacquired=" << (state.reacquired ? 1 : 0)
+                     << " local_bg=" << state.local_bg_count
+                     << " local_contrast=" << state.local_contrast_score
+                     << " local_rel_norm=" << state.local_rel_norm
+                     << " local_rel_normal=" << state.local_rel_normal
+                     << " local_rel_edge=" << state.local_rel_edge
+                     << " plane_bg=" << state.plane_bg_count
+                     << " plane_contrast=" << state.plane_contrast_score
+                     << " graph_neighbors=" << state.graph_neighbor_count
+                     << " graph_candidate=" << (state.graph_candidate ? 1 : 0)
+                     << " graph_support=" << state.graph_coherent_score
+                     << " graph_temporal=" << state.graph_temporal_score
+                     << " graph_persistence=" << state.graph_persistence_score
+                     << " dir_S_norm=" << state.directional_S.norm()
+                     << " dir_quality=" << state.directional_quality_sum
+                     << " dir_persistent=" << (state.directional_persistent ? 1 : 0)
+                     << std::endl;
+
+    logged_state.mode = state.mode;
+    logged_state.gate_state = state.gate_state;
+    logged_state.significant = state.significant;
+    logged_state.cluster_member = state.cluster_member;
+    logged_state.reacquired = state.reacquired;
+    logged_state.last_logged_stamp = stamp;
+  }
+
+  for (const int anchor_id : inactive_ids) {
+    logged_anchor_alert_plusplus_.erase(anchor_id);
+  }
+  diagnostics_log_ << std::endl;
+  diagnostics_log_.flush();
+}
+
+void DeformMonitorV3Node::MaybePrintPipelineStatus() {
+  const ros::WallTime now = ros::WallTime::now();
+  if (!last_status_wall_time_.isZero() && (now - last_status_wall_time_).toSec() < 2.0) {
+    return;
+  }
+  last_status_wall_time_ = now;
+
+  std::unique_lock<std::mutex> processing_lock(processing_mutex_, std::try_to_lock);
+  if (!processing_lock.owns_lock()) {
+    return;
+  }
+  std::lock_guard<std::mutex> data_lock(data_mutex_);
+  std::cout << "[微动监测V3] 状态"
+            << " cloud=" << cloud_msg_count_
+            << " cov=" << covariance_msg_count_
+            << " synced=" << synchronized_frame_count_
+            << " init=" << init_frame_count_ << "/" << params_.reference.init_frames
+            << " anchors=" << anchors_.size()
+            << " cloud_queue=" << cloud_queue_.size()
+            << " cov_queue=" << covariance_queue_.size()
+            << " window=" << temporal_window_frames_.size()
+            << " reference=" << (reference_ready_ ? "就绪" : "未就绪");
+
+  if (cloud_msg_count_ == 0) {
+    std::cout << " | 未收到点云话题 " << params_.io.cloud_topic;
+  } else if (covariance_msg_count_ == 0) {
+    std::cout << " | 未收到完整协方差话题 " << params_.io.covariance_topic;
+  } else if (synchronized_frame_count_ == 0) {
+    std::cout << " | 尚未形成点云-协方差同步帧";
+  } else if (!reference_ready_ && init_frame_count_ < params_.reference.init_frames) {
+    std::cout << " | 正在等待参考初始化完成";
+  } else if (!reference_ready_ && init_frame_count_ >= params_.reference.init_frames) {
+    std::cout << " | 参考初始化失败，锚单元数为 0";
+  }
+
+  std::cout << std::endl;
+}
+
+}  // namespace deform_monitor_v3

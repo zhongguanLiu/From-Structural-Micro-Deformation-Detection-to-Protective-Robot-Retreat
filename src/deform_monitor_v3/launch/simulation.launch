@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Canonical full-stack simulation entry point: Gazebo + FAST-LIO2 + V1. -->
+  <arg name="world"
+       default="$(find livox_laser_simulation)/worlds/tracked_mid360_fastlio_collapse_microdeform_sim.world" />
+  <arg name="motion_config"
+       default="$(find livox_laser_simulation)/config/synchronized_multi_model_motion.yaml" />
+  <arg name="gui" default="true" />
+  <arg name="rviz" default="true" />
+  <arg name="paused" default="false" />
+  <arg name="fast_lio_position_log" default="false" />
+  <arg name="fast_lio_performance_log" default="false" />
+  <arg name="displacement_display_scale" default="50.0" />
+  <arg name="minimum_display_arrow_m" default="0.005" />
+
+  <include file="$(find livox_laser_simulation)/launch/synchronized_multi_model_motion.launch">
+    <arg name="config" value="$(arg motion_config)" />
+    <arg name="world" value="$(arg world)" />
+    <arg name="gui" value="$(arg gui)" />
+    <arg name="paused" value="$(arg paused)" />
+  </include>
+
+  <include file="$(find fast_lio)/launch/mapping_mid360.launch">
+    <!-- Use the project-owned RViz layout; FAST-LIO itself remains unchanged. -->
+    <arg name="rviz" value="false" />
+    <arg name="runtime_pos_log_enable" value="$(arg fast_lio_position_log)" />
+    <arg name="runtime_performance_log_enable" value="$(arg fast_lio_performance_log)" />
+  </include>
+
+  <include file="$(find deform_monitor_v3)/launch/monitor_v1.launch">
+    <arg name="cloud_topic" value="/cloud_registered" />
+    <arg name="covariance_topic" value="/lio_odom_cov" />
+    <!-- The in-repository FAST-LIO2 publishes IMU-deskewed registered returns. -->
+    <arg name="upstream_registered_cloud_deskew_verified" value="true" />
+    <arg name="rviz_adapter" value="true" />
+    <arg name="displacement_display_scale"
+         value="$(arg displacement_display_scale)" />
+    <arg name="minimum_display_arrow_m"
+         value="$(arg minimum_display_arrow_m)" />
+  </include>
+
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="rviz"
+        args="-d $(find deform_monitor_v3)/config/rviz/v1_simulation.rviz"
+        output="screen" />
+
+</launch>

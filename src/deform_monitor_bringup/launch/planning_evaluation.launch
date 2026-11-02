@@ -1,0 +1,52 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Independent read-only evaluator. It never commands the robot or records bags. -->
+  <arg name="output_root"
+       default="$(eval optenv('DEFORM_MONITOR_OUTPUT_ROOT', find('deform_monitor_bringup') + '/../../experiment_output') + '/analysis')" />
+  <arg name="run_name" default="" />
+  <arg name="require_active_source" default="true" />
+  <arg name="export_mission_evacuation" default="false" />
+  <arg name="require_detection_state" default="false" />
+  <arg name="require_local_path_difference" default="true" />
+  <arg name="use_latest_complete_forecast_before_cutoff" default="false" />
+  <arg name="robot_radius_m" default="0.35" />
+  <arg name="rotation_clearance_m" default="1.00" />
+  <arg name="rotation_acceptance_tolerance_m" default="0.15" />
+  <arg name="minimum_reverse_distance_m" default="5.0" />
+  <node pkg="deform_monitor_bringup" type="static_planning_evaluation.py"
+        name="static_planning_evaluation" output="screen">
+    <rosparam param="planning_evaluation" subst_value="true">
+      world_frame: camera_init
+      cloud_topic: /cloud_registered
+      odometry_topic: /navigation/odometry
+      avoidance_topic: /deform/avoidance/frame
+      evolution_topic: /deform/evolution/frame
+      local_extent_m: 12.0
+      resolution_m: 0.10
+      robot_radius_m: $(arg robot_radius_m)
+      rotation_clearance_m: $(arg rotation_clearance_m)
+      rotation_acceptance_tolerance_m: $(arg rotation_acceptance_tolerance_m)
+      minimum_reverse_distance_m: $(arg minimum_reverse_distance_m)
+      maximum_range_m: 8.0
+      minimum_goal_radius_m: 1.5
+      maximum_goal_radius_m: 5.5
+      expected_forecast_horizons_s: [0.5, 1.0, 2.0]
+      minimum_cloud_frames: 20
+      cloud_window_frames: 40
+      cloud_window_duration_s: 4.0
+      snapshot_cloud_tolerance_s: 1.0
+      maximum_points: 300000
+      cloud_stride: 4
+      require_active_source: $(arg require_active_source)
+      export_mission_evacuation: $(arg export_mission_evacuation)
+      require_detection_state: $(arg require_detection_state)
+      require_local_path_difference: $(arg require_local_path_difference)
+      use_latest_complete_forecast_before_cutoff: $(arg use_latest_complete_forecast_before_cutoff)
+      forecast_candidate_history_size: 8
+      base_map_topic: /map
+      mission_status_topic: /deform/mission/status
+      output_root: $(arg output_root)
+      run_name: $(arg run_name)
+    </rosparam>
+  </node>
+</launch>

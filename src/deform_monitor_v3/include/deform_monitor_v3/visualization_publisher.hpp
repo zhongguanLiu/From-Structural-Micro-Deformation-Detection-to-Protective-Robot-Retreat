@@ -1,0 +1,65 @@
+#ifndef DEFORM_MONITOR_V3_VISUALIZATION_PUBLISHER_HPP
+#define DEFORM_MONITOR_V3_VISUALIZATION_PUBLISHER_HPP
+
+#include <ros/ros.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <visualization_msgs/MarkerArray.h>
+
+#include "deform_monitor_v3/AnchorStates.h"
+#include "deform_monitor_v3/MotionClusters.h"
+#include "deform_monitor_v3/data_types.hpp"
+
+namespace deform_monitor_v3 {
+
+class VisualizationPublisher {
+public:
+  void SetParams(const VisualizationParams& params);
+  void SetParams(const VisualizationParams& params, ros::NodeHandle& nh);
+
+  deform_monitor_v3::AnchorStates BuildAnchorStatesMsg(
+      const AnchorReferenceVector& anchors,
+      const AnchorStateVector& states,
+      const CurrentObservationVector& observations,
+      const ros::Time& stamp,
+      const std::string& frame_id,
+      uint32_t reference_epoch,
+      const ros::Time& reference_initialized_at) const;
+
+  deform_monitor_v3::MotionClusters BuildMotionClustersMsg(
+      const MotionClusterVector& clusters,
+      const ros::Time& stamp,
+      const std::string& frame_id) const;
+
+  sensor_msgs::PointCloud2 BuildDebugCloudMsg(
+      const AnchorReferenceVector& anchors,
+      const AnchorStateVector& states,
+      const ros::Time& stamp,
+      const std::string& frame_id) const;
+
+  visualization_msgs::MarkerArray BuildAnchorMarkers(
+      const AnchorReferenceVector& anchors,
+      const AnchorStateVector& states,
+      const ros::Time& stamp,
+      const std::string& frame_id) const;
+
+  visualization_msgs::MarkerArray BuildMotionMarkers(
+      const AnchorReferenceVector& anchors,
+      const AnchorStateVector& states,
+      const MotionClusterVector& clusters,
+      const ros::Time& stamp,
+      const std::string& frame_id) const;
+
+  void PublishStructureMigrations(
+      const StructureUnitVector& units,
+      const StructureMigrationVector& migrations,
+      const ros::Time& stamp,
+      const std::string& frame_id);
+
+private:
+  VisualizationParams params_;
+  ros::Publisher migration_pub_;
+};
+
+}  // namespace deform_monitor_v3
+
+#endif  // DEFORM_MONITOR_V3_VISUALIZATION_PUBLISHER_HPP

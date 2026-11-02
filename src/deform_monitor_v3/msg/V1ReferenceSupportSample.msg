@@ -1,0 +1,10 @@
+deform_monitor_v3/V1StableId128 gdu_id
+deform_monitor_v3/V1StableId128 surfel_id
+geometry_msgs/Point position
+float64[9] reference_covariance_row_major
+float64[9] observable_projector_row_major
+float64[4] geometry_probability
+float64 support_radius_m
+uint32 exposure_count
+uint32 point_count
+uint8 validity

@@ -1,0 +1,339 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- One-process-tree ICRA2027 mission.  No node records a rosbag. -->
+  <arg name="gui" default="true" />
+  <arg name="world" default="$(find livox_laser_simulation)/worlds/ICRA2027.world" />
+  <arg name="rviz" default="true" />
+  <arg name="rviz_config"
+       default="$(find deform_monitor_bringup)/config/rviz/icra2027_closed_loop.rviz" />
+  <arg name="paused" default="false" />
+  <arg name="wait_for_operator" default="false" />
+  <!-- Legacy standalone JSON-flattening truth recorder.  The formal
+       experiment recorder below already writes the complete canonical
+       m01 to m06 truth table, so keep this duplicate CSV writer disabled.
+       Setting this true is only for an isolated Gazebo-plugin diagnostic. -->
+  <arg name="record_truth" default="false" />
+  <!-- The rigidly calibrated tail LiDAR supplies complementary overhead and
+       rear-sector coverage for arbitrary visible geometry.  It is enabled as
+       a sensor-layout choice; no model name, object box or target location is
+       supplied to the online detector. -->
+  <arg name="enable_rear_lidar" default="true" />
+  <arg name="lidar_update_rate_hz" default="10.0" />
+  <arg name="lidar_min_range_m" default="0.5" />
+  <arg name="lidar_max_range_m" default="20.0" />
+  <arg name="primary_lidar_downsample" default="1" />
+  <arg name="secondary_lidar_downsample" default="2" />
+  <arg name="monitor_status_position_x" default="17.84" />
+  <arg name="monitor_status_position_y" default="6.7" />
+  <arg name="monitor_status_position_z" default="3.0" />
+  <!-- Exposed for isolated observability tests.  Production/full-chain runs
+       keep the package default simultaneous excitation and never alter target
+       speed. -->
+  <arg name="motion_config"
+       default="$(find livox_laser_simulation)/config/icra2027_motion.yaml" />
+  <arg name="mission_config"
+       default="$(find deform_monitor_bringup)/config/icra2027_closed_loop.yaml" />
+  <!-- Gazebo names and truth alignment are recorder-only evaluation inputs.
+       This file is intentionally never loaded into the online mission,
+       detector, evolution, avoidance or planning nodes. -->
+  <arg name="evaluation_config"
+       default="$(find deform_monitor_bringup)/config/icra2027_evaluation.yaml" />
+  <arg name="avoidance_config"
+       default="$(find deform_monitor_bringup)/config/icra2027_avoidance.yaml" />
+  <!-- Startup-time policy parameters.  They change only the downstream
+       deformation overlay; detector evidence and SLAM remain untouched. -->
+  <arg name="hard_avoidance_radius_m" default="" />
+  <arg name="warning_radius_m" default="" />
+  <arg name="elevated_hard_projection_radius_m" default="" />
+  <arg name="elevated_warning_projection_radius_m" default="" />
+  <arg name="mission_output_directory"
+       default="$(eval optenv('DEFORM_MONITOR_OUTPUT_ROOT', find('deform_monitor_bringup') + '/../../experiment_output') + '/closed_loop/icra2027_latest')" />
+  <arg name="skip_outbound_navigation" default="false" />
+  <arg name="return_after_detection" default="true" />
+  <!-- The closed loop needs move_base; sensing-only wrappers may disable it.
+       OctoMap, the fused map proxy and navigation-frame odometry remain
+       independent because stationary map/risk exports consume them. -->
+  <arg name="enable_navigation_stack" default="true" />
+  <arg name="record_experiment" default="true" />
+  <arg name="mission_full_process_observation_only" default="false" />
+  <arg name="mission_full_process_expected_duration_s" default="0.0" />
+  <arg name="mission_require_recorder_finalization"
+       default="$(arg record_experiment)" />
+  <arg name="recording_freeze_on_detection_state" default="true" />
+  <arg name="recording_freeze_on_monitoring_complete" default="false" />
+  <!-- Comma-separated Gazebo experiment elapsed times.  Empty means that
+       only mission-state/final snapshots are taken. -->
+  <arg name="recording_timeline_checkpoints_s" default="" />
+  <arg name="planning_require_active_source" default="true" />
+  <arg name="planning_export_mission_evacuation" default="true" />
+  <arg name="planning_require_detection_state" default="true" />
+  <!-- The closed-loop contract validates the full target-to-home route in the
+       mission node.  A separate nearby/local comparison is informative only. -->
+  <arg name="planning_require_local_path_difference" default="false" />
+  <!-- False in the closed loop: predictions must belong to the live/current
+       decision snapshot, never a retrospective research snapshot. -->
+  <arg name="planning_use_latest_complete_forecast_before_cutoff"
+       default="false" />
+  <!-- The current ICRA2027 fixtures apply pure translations.  The angular
+       speed parameter remains an unused controller capability because every
+       configured angular axis is zero. -->
+  <!-- Preserve the ICRA2027 experiment's original object speed.  Detection
+       coverage is improved through observability, support and viewpoint;
+       object speed is not used as a hidden sensitivity knob. -->
+  <arg name="linear_speed_mm_s" default="1.0" />
+  <arg name="angular_speed_rad_s" default="0.0015" />
+  <!-- At 1 mm/s, 15 s gives a 15 mm micro-deformation excursion.  This is
+       already three times the 5 mm simulation acceptance floor and avoids
+       turning a detection experiment into an unnecessary 40 mm translation. -->
+  <arg name="motion_start_delay_s" default="3.0" />
+  <arg name="per_model_duration_s" default="15.0" />
+  <arg name="motion_end_hold_s" default="10.0" />
+  <!-- Defaults preserve the research start.  Overrides exist only for
+       short subsystem-isolation tests; the full acceptance test uses these
+       defaults and must build the outbound map from scratch. -->
+  <!-- Start in known free space about 2 m behind wooden_case_clone_2.  The
+       model pose is not consumed by detection or navigation at runtime. -->
+  <arg name="robot_x" default="2.45606" />
+  <arg name="robot_y" default="-5.30000" />
+  <arg name="robot_z" default="1.505898" />
+  <arg name="robot_yaw" default="1.57079632679" />
+
+  <include file="$(find livox_laser_simulation)/launch/icra2027_simulation.launch">
+    <arg name="world" value="$(arg world)" />
+    <arg name="scene_record_directory" value="$(arg mission_output_directory)/scene" />
+    <arg name="motion_config" value="$(arg motion_config)" />
+    <arg name="gui" value="$(arg gui)" />
+    <arg name="rviz" value="false" />
+    <arg name="paused" value="$(arg paused)" />
+    <arg name="record_truth" value="$(arg record_truth)" />
+    <arg name="enable_rear_lidar" value="$(arg enable_rear_lidar)" />
+    <arg name="lidar_update_rate_hz" value="$(arg lidar_update_rate_hz)" />
+    <arg name="lidar_min_range_m" value="$(arg lidar_min_range_m)" />
+    <arg name="lidar_max_range_m" value="$(arg lidar_max_range_m)" />
+    <arg name="primary_lidar_downsample"
+         value="$(arg primary_lidar_downsample)" />
+    <arg name="secondary_lidar_downsample"
+         value="$(arg secondary_lidar_downsample)" />
+    <arg name="truth_output_directory" value="$(arg mission_output_directory)/truth" />
+    <arg name="linear_speed_mm_s" value="$(arg linear_speed_mm_s)" />
+    <arg name="angular_speed_rad_s" value="$(arg angular_speed_rad_s)" />
+    <arg name="start_delay" value="$(arg motion_start_delay_s)" />
+    <arg name="duration" value="$(arg per_model_duration_s)" />
+    <arg name="end_hold" value="$(arg motion_end_hold_s)" />
+    <arg name="robot_x" value="$(arg robot_x)" />
+    <arg name="robot_y" value="$(arg robot_y)" />
+    <arg name="robot_z" value="$(arg robot_z)" />
+    <arg name="robot_yaw" value="$(arg robot_yaw)" />
+  </include>
+
+  <include file="$(find fast_lio)/launch/mapping_mid360.launch">
+    <arg name="rviz" value="false" />
+    <arg name="runtime_pos_log_enable" value="false" />
+    <arg name="runtime_performance_log_enable" value="false" />
+    <!-- Formal dual-merge compaction removes no-return sentinels before
+         FAST-LIO.  Freeze the preprocessor stride so scene-dependent sentinel
+         counts cannot change a hidden sampling phase. -->
+    <arg name="point_filter_num" value="1" />
+    <arg name="filter_size_surf" value="0.30" />
+    <arg name="filter_size_map" value="0.30" />
+    <arg name="cloud_output_point_stride" value="1" />
+  </include>
+
+  <node pkg="deform_monitor_bringup" type="stationary_monitor_cloud_adapter.py"
+        name="stationary_monitor_cloud_adapter" output="screen" required="true">
+    <param name="registered_topic" value="/cloud_registered" />
+    <param name="body_topic" value="/cloud_registered_body" />
+    <param name="navigation_output_topic"
+           value="/navigation/cloud_registered_body" />
+    <!-- Calibrated in the primary FAST-LIO body frame.  Only returns inside
+         the physical A2 envelope are removed; the detector keeps the raw
+         registered cloud and therefore receives no navigation preprocessing. -->
+    <rosparam param="self_filter_min_xyz">[-0.70, -0.38, -0.35]</rosparam>
+    <rosparam param="self_filter_max_xyz">[0.12, 0.38, 0.35]</rosparam>
+    <param name="odometry_topic" value="/Odometry" />
+    <param name="mission_status_topic" value="/deform/mission/status" />
+    <param name="output_topic" value="/monitor/cloud_registered" />
+    <param name="world_frame" value="camera_init" />
+    <!-- Match the detector's frozen 0.10 m surfel lattice: one real return
+         nearest each world-fixed cell center is retained per exposure. -->
+    <param name="monitor_voxel_size_m" value="0.10" />
+    <!-- Each physical ray sensor already enforces its own 0.5 to 20 m range.
+         A second radial crop about the primary IMU would be geometrically
+         wrong for the tail sensor, whose origin is 0.6181 m away. -->
+    <param name="monitor_apply_radial_range_filter" value="false" />
+  </node>
+
+  <include file="$(find deform_monitor_v3)/launch/monitor_v1.launch">
+    <arg name="cloud_topic" value="/monitor/cloud_registered" />
+    <arg name="covariance_topic" value="/lio_odom_cov" />
+    <arg name="upstream_registered_cloud_deskew_verified" value="true" />
+    <arg name="upstream_stationary_pose_freeze_verified" value="true" />
+    <!-- Visibility uses a conservative compound-rig envelope about the
+         primary FAST-LIO origin; physical returns remain limited to 20 m
+         about each individual LiDAR by Gazebo. -->
+    <arg name="visibility_min_range_m" value="0.0" />
+    <arg name="visibility_max_range_m" value="20.75" />
+    <arg name="rviz_adapter" value="true" />
+    <arg name="status_position_x" value="$(arg monitor_status_position_x)" />
+    <arg name="status_position_y" value="$(arg monitor_status_position_y)" />
+    <arg name="status_position_z" value="$(arg monitor_status_position_z)" />
+    <arg name="status_detail_topic" value="/deform/mission/clock_text" />
+  </include>
+  <include file="$(find deform_evolution_map)/launch/evolution.launch" />
+  <include file="$(find deform_avoidance_map)/launch/avoidance.launch">
+    <arg name="config" value="$(arg avoidance_config)" />
+    <arg name="hard_avoidance_radius_m"
+         value="$(arg hard_avoidance_radius_m)" />
+    <arg name="warning_radius_m" value="$(arg warning_radius_m)" />
+    <arg name="elevated_hard_projection_radius_m"
+         value="$(arg elevated_hard_projection_radius_m)" />
+    <arg name="elevated_warning_projection_radius_m"
+         value="$(arg elevated_warning_projection_radius_m)" />
+  </include>
+
+  <!-- The body-frame current scan plus camera_init->body TF gives OctoMap the
+       true moving sensor origin.  Feeding /cloud_registered here would make
+       every ray originate at the fixed map origin and is therefore invalid. -->
+  <node pkg="octomap_server" type="octomap_server_node"
+        name="mission_octomap" output="screen" required="true">
+    <remap from="cloud_in" to="/navigation/cloud_registered_body" />
+    <remap from="projected_map" to="/mission/slam_map_raw" />
+    <param name="frame_id" value="camera_init" />
+    <param name="resolution" value="0.15" />
+    <param name="sensor_model/max_range" value="12.0" />
+    <param name="sensor_model/hit" value="0.70" />
+    <param name="sensor_model/miss" value="0.40" />
+    <param name="sensor_model/min" value="0.12" />
+    <param name="sensor_model/max" value="0.97" />
+    <param name="pointcloud_min_z" value="-0.35" />
+    <param name="pointcloud_max_z" value="1.40" />
+    <param name="occupancy_min_z" value="-0.30" />
+    <param name="occupancy_max_z" value="1.20" />
+    <param name="filter_speckles" value="true" />
+    <param name="incremental_2D_projection" value="true" />
+    <param name="compress_map" value="true" />
+  </node>
+
+  <node pkg="deform_monitor_bringup" type="mission_map_proxy.py"
+        name="mission_map_proxy" output="screen" required="true">
+    <param name="base_topic" value="/mission/slam_map_raw" />
+    <param name="normalized_base_topic" value="/map" />
+    <param name="overlay_topic" value="/deform/avoidance/current_overlay" />
+    <param name="output_topic" value="/mission/navigation_map" />
+    <param name="odometry_topic" value="/navigation/odometry" />
+    <param name="mission_status_topic" value="/deform/mission/status" />
+    <param if="$(arg record_experiment)" name="snapshot_directory"
+           value="$(arg mission_output_directory)/navigation/maps" />
+  </node>
+
+  <!-- DWA requires measured Twist, while FAST-LIO /Odometry intentionally
+       carries pose only.  Derive Twist from that same pose stream instead of
+       introducing Gazebo ground truth into navigation. -->
+  <node pkg="deform_monitor_bringup" type="lio_twist_odometry.py"
+        name="lio_twist_odometry" output="screen" required="true">
+    <param name="input_topic" value="/Odometry" />
+    <param name="output_topic" value="/navigation/odometry" />
+    <param name="maximum_linear_speed_mps" value="3.0" />
+    <param name="maximum_angular_speed_rad_s" value="3.0" />
+    <!-- FAST-LIO body is the front IMU.  Navigation and the symmetric robot
+         footprint use the calibrated base centre instead. -->
+    <rosparam param="body_to_navigation_base_xyz">[-0.2801, 0.0, -0.616928878]</rosparam>
+    <param name="navigation_base_frame" value="navigation_base" />
+  </node>
+
+  <node if="$(arg enable_navigation_stack)"
+        pkg="move_base" type="move_base" name="move_base"
+        output="screen" required="true">
+    <!-- These files are private move_base parameters.  Loading them at the
+         ROS root silently makes move_base fall back to map/base_link. -->
+    <rosparam command="load"
+              file="$(find deform_monitor_bringup)/config/icra2027_move_base.yaml" />
+    <rosparam command="load"
+              file="$(find deform_monitor_bringup)/config/icra2027_global_costmap.yaml" />
+    <rosparam command="load"
+              file="$(find deform_monitor_bringup)/config/icra2027_local_costmap.yaml" />
+  </node>
+
+  <node pkg="deform_monitor_bringup"
+        type="icra2027_closed_loop_mission.py"
+        name="icra2027_closed_loop_mission" output="screen" required="true">
+    <rosparam command="load" file="$(arg mission_config)" />
+    <param name="mission/output_directory"
+           value="$(arg mission_output_directory)" />
+    <param name="mission/wait_for_operator" value="$(arg wait_for_operator)" />
+    <param name="mission/skip_outbound_navigation"
+           value="$(arg skip_outbound_navigation)" />
+    <param name="mission/return_after_detection"
+           value="$(arg return_after_detection)" />
+    <param name="mission/full_process_observation_only"
+           value="$(arg mission_full_process_observation_only)" />
+    <param name="mission/full_process_expected_experiment_duration_s"
+           value="$(arg mission_full_process_expected_duration_s)" />
+    <param name="mission/require_recorder_finalization"
+           value="$(arg mission_require_recorder_finalization)" />
+  </node>
+
+  <!-- Structured research recorder.  It writes bounded CSV/JSON/NPZ/PNG
+       products and never starts rosbag.  Gazebo truth is evaluation-only. -->
+  <node if="$(arg record_experiment)" pkg="deform_monitor_bringup"
+        type="icra2027_experiment_recorder.py"
+        name="icra2027_experiment_recorder" output="screen" required="true">
+    <rosparam command="load" file="$(arg mission_config)" />
+    <rosparam command="load" file="$(arg evaluation_config)" />
+    <param name="output_directory" value="$(arg mission_output_directory)" />
+    <param name="mission/skip_outbound_navigation"
+           value="$(arg skip_outbound_navigation)" />
+    <param name="mission/return_after_detection"
+           value="$(arg return_after_detection)" />
+    <param name="freeze_on_detection_state"
+           value="$(arg recording_freeze_on_detection_state)" />
+    <param name="freeze_on_monitoring_complete"
+           value="$(arg recording_freeze_on_monitoring_complete)" />
+    <param name="timeline_checkpoints_s"
+           value="$(arg recording_timeline_checkpoints_s)" />
+    <!-- This launch and its stationary wrapper are the two formal calibrated
+         dual-LiDAR experiments.  Recorder finalization must fail if overlap,
+         synchronization, pairing or drop acceptance is not met. -->
+    <param name="require_dual_lidar_success_contract" value="true" />
+    <!-- Keep the recorder's acceptance expectations tied to this run's
+         actual sensor arguments.  Overriding 1/2 with 2/2 therefore changes
+         the expected deterministic point counts instead of producing a
+         false hard-coded contract failure.  The measured default stays 1/2. -->
+    <param name="dual_lidar_contract/configured_sensor_update_rate_hz"
+           value="$(arg lidar_update_rate_hz)" />
+    <param name="dual_lidar_contract/configured_min_range_m"
+           value="$(arg lidar_min_range_m)" />
+    <param name="dual_lidar_contract/configured_max_range_m"
+           value="$(arg lidar_max_range_m)" />
+    <param name="dual_lidar_contract/configured_ray_samples_per_sensor"
+           value="20000" />
+    <param name="dual_lidar_contract/primary_downsample"
+           value="$(arg primary_lidar_downsample)" />
+    <param name="dual_lidar_contract/secondary_downsample"
+           value="$(arg secondary_lidar_downsample)" />
+  </node>
+
+  <!-- Stationary, data-derived paper maps plus a full-map target-to-recorded-
+       home route comparison.  The mission waits for this exporter before it
+       starts moving home, so all products describe one detection snapshot. -->
+  <include file="$(find deform_monitor_bringup)/launch/planning_evaluation.launch">
+    <arg name="output_root" value="$(arg mission_output_directory)/analysis" />
+    <arg name="run_name" value="deformation_route_maps" />
+    <arg name="require_active_source"
+         value="$(arg planning_require_active_source)" />
+    <arg name="export_mission_evacuation"
+         value="$(arg planning_export_mission_evacuation)" />
+    <arg name="require_detection_state"
+         value="$(arg planning_require_detection_state)" />
+    <arg name="require_local_path_difference"
+         value="$(arg planning_require_local_path_difference)" />
+    <arg name="use_latest_complete_forecast_before_cutoff"
+         value="$(arg planning_use_latest_complete_forecast_before_cutoff)" />
+    <arg name="robot_radius_m" value="0.30" />
+  </include>
+
+  <node if="$(arg rviz)" pkg="rviz" type="rviz"
+        name="closed_loop_rviz"
+        args="-d $(arg rviz_config)"
+        output="screen" required="false" />
+</launch>

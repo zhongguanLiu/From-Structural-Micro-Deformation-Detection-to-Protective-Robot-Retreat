@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>m3c2_baseline</name><version>0.1.0</version>
+  <description>Research_works4 M3C2 implementation with an independent benchmark adapter.</description>
+  <maintainer email="zgliu@example.com">zgliu</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>roscpp</depend><depend>sensor_msgs</depend><depend>std_msgs</depend>
+  <depend>pcl_ros</depend><depend>pcl_conversions</depend><depend>zlib</depend>
+</package>

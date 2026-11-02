@@ -1,0 +1,10 @@
+# Local interpreter and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Legacy in-package runtime directories. Canonical runs write to
+# /home/zgliu/Research_works5/experiment_output instead.
+log/
+output/
+realrobot_output/

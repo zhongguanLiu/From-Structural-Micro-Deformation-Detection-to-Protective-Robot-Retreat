@@ -1,0 +1,11 @@
+deform_monitor_v3/V1StableId128 component_id
+float64 weight
+uint8 structural_state
+uint8 geometry_hypothesis
+geometry_msgs/Vector3 displacement_mean
+geometry_msgs/Vector3 velocity_mean
+deform_monitor_v3/V1DenseMatrix64 displacement_covariance
+deform_monitor_v3/V1DenseMatrix64 velocity_covariance
+deform_monitor_v3/V1DenseMatrix64 observable_projector
+bool minimum_detectable_effect_defined
+float64 minimum_detectable_effect_m

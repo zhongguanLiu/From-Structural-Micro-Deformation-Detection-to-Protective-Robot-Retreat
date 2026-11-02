@@ -1,0 +1,9 @@
+deform_monitor_v3/V1StableId128 cause_id
+deform_monitor_v3/V1StableId128[] source_ids
+uint8 semantics
+uint32 correlation_group
+float64 probability_lower
+float64 probability_mean
+float64 probability_upper
+bool probability_mean_identified
+float64 other_mass

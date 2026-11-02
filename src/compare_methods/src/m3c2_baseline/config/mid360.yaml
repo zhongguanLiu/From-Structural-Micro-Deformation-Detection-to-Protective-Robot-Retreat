@@ -1,0 +1,18 @@
+# Unchanged numerical settings from works4 baseline_formal_10obj.yaml.
+reference:
+  init_frames: 30
+  voxel_size: 0.05
+temporal:
+  window_frames: 5
+  voxel_size: 0.05
+m3c2:
+  core_voxel_size: 0.05
+  normal_radius: 0.12
+  cylinder_radius: 0.10
+  cylinder_half_length: 0.20
+  min_support: 5
+  registration_stddev: 0.002
+  cluster:
+    tolerance: 0.12
+    min_cluster_size: 3
+    max_cluster_size: 100000

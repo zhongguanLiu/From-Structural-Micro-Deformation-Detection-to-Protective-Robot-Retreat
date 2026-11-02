@@ -1,0 +1,47 @@
+uint8 MAGNITUDE_UNKNOWN=0
+uint8 MAGNITUDE_INCREASING=1
+uint8 MAGNITUDE_STABLE=2
+uint8 MAGNITUDE_DECREASING=3
+
+uint8 LIFECYCLE_INACTIVE=0
+uint8 LIFECYCLE_NEWLY_DETECTED=1
+uint8 LIFECYCLE_PERSISTENT=2
+uint8 LIFECYCLE_CLEAR_CANDIDATE=3
+uint8 LIFECYCLE_INCONCLUSIVE=4
+uint8 LIFECYCLE_PENDING_CONFIRMATION=5
+
+uint8 ACTIVATION_STRICT_ADMISSION=0
+uint8 ACTIVATION_RESEARCH_POSTERIOR=1
+
+string gdu_id
+uint8 detection_admission
+uint8 validity
+uint8 activation_mode
+bool active_now
+bool retained_for_avoidance
+uint32 retained_birth_streak
+uint32 retained_birth_confirmations
+uint32 clear_streak
+uint8 lifecycle_state
+uint8 magnitude_trend
+float64 task_scale_probability
+bool task_scale_probability_mean_identified
+string task_scale_probability_statistic
+float64 displacement_rms_m
+float64 previous_displacement_rms_m
+float64 displacement_change_m
+float64 observation_interval_s
+float64 displacement_rate_mps
+float64 displacement_sigma_upper_m
+float64 velocity_sigma_upper_mps
+bool displacement_uncertainty_defined
+bool velocity_uncertainty_defined
+float64 direction_change_rad
+float64 support_radius_m
+geometry_msgs/Vector3 mean_displacement
+geometry_msgs/Vector3 mean_velocity
+geometry_msgs/Point[] reference_support
+geometry_msgs/Point[] current_support
+geometry_msgs/Vector3[] displacement_samples
+geometry_msgs/Vector3[] velocity_samples
+deform_evolution_map/GduForecast[] forecasts

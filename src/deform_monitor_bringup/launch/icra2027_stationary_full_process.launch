@@ -1,0 +1,96 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Spawn directly at the validated observation pose, keep the robot
+       stationary, observe the full 0-10-50-60 s motion timeline, and export
+       deformation/risk-map products without starting a return. -->
+  <arg name="gui" default="true" />
+  <arg name="world" default="$(find livox_laser_simulation)/worlds/ICRA2027.world" />
+  <arg name="rviz" default="true" />
+  <arg name="rviz_config"
+       default="$(find deform_monitor_bringup)/config/rviz/icra2027_closed_loop.rviz" />
+  <arg name="record_experiment" default="true" />
+  <arg name="wait_for_operator" default="false" />
+  <arg name="lidar_update_rate_hz" default="10.0" />
+  <arg name="lidar_min_range_m" default="0.5" />
+  <arg name="lidar_max_range_m" default="20.0" />
+  <arg name="primary_lidar_downsample" default="1" />
+  <arg name="secondary_lidar_downsample" default="2" />
+  <!-- The speed sweep changes only the scalar translation speed.  The
+       per-model angular axes remain zero in the stationary motion YAML, so
+       retaining the angular-speed parameter does not activate rotation. -->
+  <arg name="linear_speed_mm_s" default="1.0" />
+  <arg name="angular_speed_rad_s" default="0.0015" />
+  <arg name="mission_output_directory"
+       default="$(eval optenv('DEFORM_MONITOR_OUTPUT_ROOT', find('deform_monitor_bringup') + '/../../experiment_output') + '/stationary_full_process/icra2027_latest')" />
+  <arg name="evaluation_config"
+       default="$(find deform_monitor_bringup)/config/icra2027_evaluation.yaml" />
+  <arg name="hard_avoidance_radius_m" default="" />
+  <arg name="warning_radius_m" default="" />
+  <arg name="elevated_hard_projection_radius_m" default="" />
+  <arg name="elevated_warning_projection_radius_m" default="" />
+
+  <include file="$(find deform_monitor_bringup)/launch/icra2027_closed_loop.launch">
+    <arg name="world" value="$(arg world)" />
+    <arg name="gui" value="$(arg gui)" />
+    <arg name="rviz" value="$(arg rviz)" />
+    <arg name="rviz_config" value="$(arg rviz_config)" />
+    <arg name="record_experiment" value="$(arg record_experiment)" />
+    <arg name="wait_for_operator" value="$(arg wait_for_operator)" />
+    <arg name="lidar_update_rate_hz" value="$(arg lidar_update_rate_hz)" />
+    <arg name="lidar_min_range_m" value="$(arg lidar_min_range_m)" />
+    <arg name="lidar_max_range_m" value="$(arg lidar_max_range_m)" />
+    <arg name="primary_lidar_downsample"
+         value="$(arg primary_lidar_downsample)" />
+    <arg name="secondary_lidar_downsample"
+         value="$(arg secondary_lidar_downsample)" />
+    <arg name="linear_speed_mm_s" value="$(arg linear_speed_mm_s)" />
+    <arg name="angular_speed_rad_s" value="$(arg angular_speed_rad_s)" />
+    <!-- Direct-spawn FAST-LIO starts its local camera_init frame at the
+         observation pose, so place the status text near that local origin. -->
+    <arg name="monitor_status_position_x" value="0.0" />
+    <arg name="monitor_status_position_y" value="0.0" />
+    <arg name="monitor_status_position_z" value="3.0" />
+    <arg name="mission_output_directory" value="$(arg mission_output_directory)" />
+    <arg name="evaluation_config" value="$(arg evaluation_config)" />
+    <arg name="hard_avoidance_radius_m"
+         value="$(arg hard_avoidance_radius_m)" />
+    <arg name="warning_radius_m" value="$(arg warning_radius_m)" />
+    <arg name="elevated_hard_projection_radius_m"
+         value="$(arg elevated_hard_projection_radius_m)" />
+    <arg name="elevated_warning_projection_radius_m"
+         value="$(arg elevated_warning_projection_radius_m)" />
+    <arg name="skip_outbound_navigation" value="true" />
+    <arg name="return_after_detection" value="false" />
+    <!-- Sensing-only mode keeps OctoMap, map fusion and all deformation/risk
+         exporters, but does not spend CPU on an unused move_base process. -->
+    <arg name="enable_navigation_stack" value="false" />
+    <arg name="mission_full_process_observation_only" value="true" />
+    <arg name="mission_full_process_expected_duration_s" value="60.0" />
+    <arg name="mission_require_recorder_finalization"
+         value="$(arg record_experiment)" />
+    <arg name="recording_freeze_on_detection_state" value="false" />
+    <arg name="recording_freeze_on_monitoring_complete" value="true" />
+    <arg name="recording_timeline_checkpoints_s" value="0,10,50,60" />
+    <arg name="planning_require_active_source" value="false" />
+    <arg name="planning_export_mission_evacuation" value="false" />
+    <arg name="planning_require_detection_state" value="true" />
+    <!-- This mode evaluates sensing over the complete timeline and does not
+         impose a route-change objective.  It still exports both paths and an
+         explicit local_paths_differ metric when a comparison is available. -->
+    <arg name="planning_require_local_path_difference" value="false" />
+    <!-- Preserve the final 60 s current map while exporting the newest complete
+         runtime forecast bundle at or before the capture cutoff. -->
+    <arg name="planning_use_latest_complete_forecast_before_cutoff"
+         value="true" />
+    <arg name="motion_config"
+         value="$(find livox_laser_simulation)/config/icra2027_stationary_full_process_motion.yaml" />
+    <arg name="motion_start_delay_s" value="10.0" />
+    <arg name="per_model_duration_s" value="40.0" />
+    <arg name="motion_end_hold_s" value="10.0" />
+    <!-- Model-origin pose reconstructed from the verified monitoring body
+         pose (-3.9241, 12.3769, 2.0688) and the fixed 0.2801 m body offset. -->
+    <arg name="robot_x" value="-3.7902" />
+    <arg name="robot_y" value="12.1308" />
+    <arg name="robot_yaw" value="2.0688" />
+  </include>
+</launch>

@@ -1,0 +1,63 @@
+# Loading this file never starts motion. Use icra2027_motion_cli.py run.
+start_delay: 3.0
+# All controlled fixtures start together.  No fixture is privileged by an
+# excitation order; the first persistent GDU is determined only by the generic
+# point-cloud detector.
+motion_mode: simultaneous
+duration: 15.0
+end_hold: 10.0
+truth_rate_hz: 10.0
+linear_speed_mm_s: 1.0
+angular_speed_rad_s: 0.0015
+
+# Commands use fixed world axes. Surface points are model-root-local collision
+# corners used only for rotation truth; they are not Gazebo visuals/collisions.
+models:
+  - id: 1
+    model_name: m01
+    command_frame: world
+    # Offline evaluation of the 20260831 reference gives the stable observable
+    # surface normal below in world coordinates.  This fixture-only direction
+    # is never published to or consumed by the online detector.
+    linear_direction: [-0.9000116564182479, -0.4274638382988337, 0.0851685696610569]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []
+  - id: 2
+    model_name: m02
+    command_frame: world
+    linear_direction: [0.9008828563623635, -0.4052922873611565, 0.1553970428224124]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []
+  - id: 3
+    model_name: m03
+    command_frame: world
+    linear_direction: [0.0966034850335850, -0.9902357233980940, 0.1005036257336987]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []
+  - id: 4
+    model_name: m04
+    command_frame: world
+    # Translate toward the fixed observation pose.  Radial motion maximizes
+    # range change if any currently occluded person surface becomes visible;
+    # it cannot manufacture a reference for a surface that stays occluded.
+    linear_direction: [0.6989996111759129, -0.7151220480281130, 0.0]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []
+  - id: 5
+    model_name: m05
+    command_frame: world
+    # World-frame inverse rotation of the frozen map-frame observable normal.
+    # The 20260831 full-process audit verified 99% observable projection for
+    # this axis; it remains a Gazebo excitation choice, never a detector prior.
+    linear_direction: [-0.7603891569279329, -0.6493907397540762, -0.0099998574030501]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []
+  - id: 6
+    model_name: m06
+    command_frame: world
+    # Downward broad-face normal computed from the slab's frozen Gazebo pose.
+    # It maps to (-0.0822, 0.0730, -0.9939) in camera_init and is directly
+    # observable by the tilted Mid360.  The speed remains exactly 1 mm/s.
+    linear_direction: [-0.0730428778713612, -0.0822176285782220, -0.9939341022136442]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []

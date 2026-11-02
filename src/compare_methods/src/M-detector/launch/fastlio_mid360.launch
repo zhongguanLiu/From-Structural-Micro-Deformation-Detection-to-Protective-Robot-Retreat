@@ -1,0 +1,17 @@
+<launch>
+  <arg name="config" default="$(find m_detector)/config/mid360/mid360.yaml" />
+  <arg name="points_topic" default="/cloud_registered_body" />
+  <arg name="odometry_topic" default="/Odometry" />
+  <arg name="dynamic_topic" default="/compare/m_detector/dynamic_points" />
+  <arg name="runtime_topic" default="/compare/m_detector/runtime" />
+
+  <rosparam command="load" file="$(arg config)" />
+  <param name="dyn_obj/points_topic" value="$(arg points_topic)" />
+  <param name="dyn_obj/odom_topic" value="$(arg odometry_topic)" />
+  <param name="dyn_obj/point_output_topic" value="$(arg dynamic_topic)" />
+  <param name="dyn_obj/runtime_output_topic" value="$(arg runtime_topic)" />
+  <param name="dyn_obj/out_file" value="" />
+  <param name="dyn_obj/out_file_origin" value="" />
+  <node pkg="m_detector" type="dynfilter" name="m_detector_compare"
+        output="log" required="true" />
+</launch>

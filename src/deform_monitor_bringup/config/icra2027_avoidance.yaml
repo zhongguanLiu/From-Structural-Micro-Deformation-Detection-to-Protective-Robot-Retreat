@@ -1,0 +1,40 @@
+deform_avoidance:
+  input_topic: /deform/evolution/frame
+  base_map_topic: /map
+  current_overlay_topic: /deform/avoidance/current_overlay
+  fused_map_topic: /deform/avoidance/fused_map
+  frame_topic: /deform/avoidance/frame
+  alert_topic: /deform/avoidance/alerts
+  world_frame: camera_init
+  resolution_m: 0.10
+  origin_x_m: -20.0
+  origin_y_m: -20.0
+  width_m: 40.0
+  height_m: 40.0
+
+  # ICRA2027 ground-robot task policy.  This is a soft-cost clearance around
+  # LiDAR-observed deformation support, not a material/collapse model.  The
+  # ordinary policy remains conservative for wall/ground-level supports.
+  # The robot footprint is handled independently by the planner.
+  hard_avoidance_radius_m: 2.20
+  warning_radius_m: 3.00
+  # A high suspended GDU is selected only by its observed median camera_init z,
+  # never by a Gazebo model name, object class or truth box.  Its observed
+  # support points define the ground footprint; the GDU bounding radius is not
+  # added again.  This penalizes the region underneath the panel while retaining
+  # geometrically free side passages.  The two clearances are respectively the
+  # high-cost core margin and the visual/planning warning margin.
+  elevated_source_min_z_m: 2.70
+  elevated_hard_projection_radius_m: 1.20
+  elevated_warning_projection_radius_m: 1.80
+  # Legacy hard_* names denote the high-cost core, NOT a forbidden zone.
+  hard_cost: 99
+  warning_peak_cost: 98
+  publish_overlay_as_fused_without_base: false
+  include_reference_and_current_support: true
+  vertical_projection_policy: ALL_ACTIVE_SUPPORT_TO_GROUND
+  forecast_is_visualization_only: true
+  forecast_overlay_topics:
+    "0.5": /deform/avoidance/forecast_0p5s
+    "1.0": /deform/avoidance/forecast_1p0s
+    "2.0": /deform/avoidance/forecast_2p0s

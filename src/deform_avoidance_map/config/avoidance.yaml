@@ -1,0 +1,32 @@
+deform_avoidance:
+  input_topic: /deform/evolution/frame
+  base_map_topic: /map
+  current_overlay_topic: /deform/avoidance/current_overlay
+  fused_map_topic: /deform/avoidance/fused_map
+  frame_topic: /deform/avoidance/frame
+  alert_topic: /deform/avoidance/alerts
+  world_frame: camera_init
+  resolution_m: 0.10
+  origin_x_m: -20.0
+  origin_y_m: -20.0
+  width_m: 40.0
+  height_m: 40.0
+  hard_avoidance_radius_m: 0.75
+  warning_radius_m: 1.25
+  elevated_source_min_z_m: 2.70
+  elevated_hard_projection_radius_m: 0.25
+  elevated_warning_projection_radius_m: 0.60
+  # Legacy hard_* names denote the high-cost core, NOT a forbidden zone.
+  hard_cost: 99
+  warning_peak_cost: 98
+  publish_overlay_as_fused_without_base: false
+  include_reference_and_current_support: true
+  # Every active support is projected to XY.  Sources above the configured z
+  # threshold use their sampled horizontal footprint and the elevated radii;
+  # ordinary sources retain the GDU support radius and ordinary radii.
+  vertical_projection_policy: ALL_ACTIVE_SUPPORT_TO_GROUND
+  forecast_is_visualization_only: true
+  forecast_overlay_topics:
+    "0.5": /deform/avoidance/forecast_0p5s
+    "1.0": /deform/avoidance/forecast_1p0s
+    "2.0": /deform/avoidance/forecast_2p0s

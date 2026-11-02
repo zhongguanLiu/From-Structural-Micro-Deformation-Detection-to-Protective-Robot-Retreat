@@ -1,0 +1,114 @@
+mission:
+  # false/true is the full navigation loop.  The dedicated detection
+  # benchmark launch overrides these to true/false and starts at the sensor
+  # observation pose without changing the detector itself.
+  skip_outbound_navigation: false
+  return_after_detection: true
+  # A return is triggered when one generic algorithm GDU remains a retained
+  # causal hazard for 10 s of source time.  Retention starts only after the
+  # evolution layer obtains three fresh observable active measurements within
+  # its 15 s confirmation window, and ends only when that
+  # layer explicitly clears/removes the same GDU.  Temporary active_now or
+  # observability loss therefore does not erase a cause already committed to
+  # the avoidance map.  Invalid/incomplete snapshots reset the timer, and a
+  # non-monotone source clock restarts the affected GDU.  No Gazebo model name
+  # or pre-registered object region is available online.
+  return_trigger_persistence_s: 10.0
+  # This waypoint is explicitly in FAST-LIO camera_init.  The online mission
+  # neither converts it through Gazebo world nor reads robot/object truth.
+  # The spawn moved 4.36345 m forward in Gazebo world +y.  With the initial
+  # +90 deg yaw this shortens camera_init +x by the same amount, preserving
+  # the original physical observation pose.
+  approach_map_xy: [17.84, 6.70]
+  approach_yaw_map_deg: 0.0
+  arrival_tolerance_m: 0.80
+  arrival_yaw_tolerance_deg: 45.0
+  # Position is latched first; heading is then aligned without allowing the
+  # robot to leave the accepted 0.80 m disk.
+  # A 75--180 deg turn at the deliberately low 0.15 rad/s return limit needs
+  # more wall time when the six-body dual-LiDAR simulation runs below real
+  # time.  This is a wall-clock watchdog, not a relaxed angular tolerance.
+  heading_alignment_timeout_s: 180.0
+  home_tolerance_m: 0.80
+  # A* uses the 0.30 m inscribed radius of the configured 0.72 x 0.60 m
+  # footprint.  Reverse execution checks the full oriented rectangle.
+  robot_radius_m: 0.30
+  footprint_half_length_m: 0.36
+  footprint_half_width_m: 0.30
+  frontier_backoff_m: 0.45
+  stable_dwell_s: 10.0
+  # Both dwell parameters are wall-clock preparation intervals; frozen-reference
+  # acknowledgement is additionally required. They are not motion experiment time.
+  # Collect filtered, stationary MAPPING_CONTEXT frames before asking the
+  # detector to freeze a reference. Frame count depends on real-time factor;
+  # the detector compares at most 5*6 reference-only candidate frames.
+  reference_preparation_dwell_s: 20.0
+  # Computational support is latched around the current FAST-LIO sensor pose,
+  # never around a model, object box or Gazebo world coordinate.  The physical
+  # 0.5--20 m LiDAR range remains available to FAST-LIO/global mapping.
+  # Deformation estimation is deliberately local: one target-agnostic box is
+  # anchored at the current LIO pose when the stationary dwell starts.  This
+  # bounds the frozen surfel/GDU product without using object names, Gazebo
+  # truth, AABBs, or pre-registered monitoring boxes.  The asymmetric height
+  # retains overhead geometry while excluding irrelevant underground/remote
+  # surfaces from the deformation posterior.
+  monitor_roi_half_extent_m: 10.0
+  monitor_roi_below_sensor_m: 1.0
+  monitor_roi_above_sensor_m: 6.5
+  navigation_timeout_s: 1200.0
+  # Six kinematic monitored collision bodies lower Gazebo's real-time factor;
+  # navigation timeouts are wall-clock contracts and must not expire while a
+  # valid >1 m/s command is advancing normally in simulation time.
+  single_goal_timeout_s: 360.0
+  # Cancel an ACTIVE move_base goal when its remaining distance has not
+  # improved by 0.15 m for 35 wall-clock seconds.  This catches a local DWA
+  # dead end without declaring UNKNOWN traversable or exhausting the entire
+  # mission timeout on one frontier.
+  goal_progress_timeout_s: 35.0
+  # The single full-map HOME leg uses the same 0.15 m progress increment but
+  # allows costmap recovery under the ~0.2 real-time factor of the complete
+  # six-body, dual-LiDAR experiment.  This does not change HOME tolerance.
+  return_goal_progress_timeout_s: 120.0
+  goal_progress_distance_m: 0.15
+  frontier_blacklist_radius_m: 0.90
+  # The strict global deformation-aware A* path is sampled to validate route
+  # continuity and locate a known-free point with circular turn clearance.
+  # Raster samples are not individual action goals: Navfn/DWA tracks the same
+  # fused map continuously, avoiding artificial grid stop-and-turn commands.
+  return_waypoint_spacing_m: 0.75
+  # Use one short reverse-consistent segment to create turning clearance at
+  # the monitoring pose.  The measured DWA reverse trajectory reliably moves
+  # beyond the 0.80 m arrival disk before long reverse turning becomes unstable.
+  return_reverse_escape_distance_m: 0.75
+  # Auxiliary pass-through tolerance on a validated continuous polyline.  It
+  # absorbs one low-real-time control-cycle overshoot without relaxing the
+  # final HOME tolerance or any risk/UNKNOWN cell constraint.
+  return_reverse_escape_tolerance_m: 0.15
+  # Outbound exploration remains capped at 1.25 m/s.  The final forward
+  # return is capped at 1.10 m/s: above the requested 1 m/s while retaining
+  # margin below the simulated planar controller and DWA 1.25 m/s limit.
+  return_forward_max_speed_mps: 1.10
+  # A transient costmap/TF refresh longer than one 15 Hz control cycle is not
+  # a route failure.  The robot holds zero velocity for this bounded interval;
+  # no unsafe command is issued while waiting.
+  return_unsafe_hold_timeout_s: 10.0
+  reference_timeout_s: 240.0
+  # Baseline duration comes from launch: closed loop 3 sim s; stationary
+  # full-process 10 sim s. The watchdog uses wall time, not simulation time.
+  motion_start_timeout_s: 180.0
+  # The simultaneous 1 mm/s excitation and persistence gate use simulation
+  # time.  This wall-clock timeout covers the reduced Gazebo real-time factor.
+  detection_timeout_s: 1800.0
+  # Before return wait only for stationary input capture + atomic retained map.
+  # Plotting and analysis export continue asynchronously during navigation.
+  # Stationary-only experiments still wait for export completion.
+  evaluation_timeout_s: 180.0
+  # COMPLETED is not allowed to tear down roslaunch until the structured
+  # recorder has atomically committed run_manifest.json and all analyses.
+  recorder_finalization_timeout_s: 180.0
+
+  # Must equal deform_monitor_v3/config/v1/resource_v1.yaml.  This is the
+  # detector's deterministic identity domain, not a free mission label.
+  session_id: deform-monitor-research-session-v1
+  motion_namespace: /icra2027_motion
+  stop_motion_on_return: true

@@ -1,0 +1,22 @@
+# Real-data starting profile, NOT a measured calibration or a validated false-alarm rate.
+# Loaded after the shared v1 defaults only by real.launch. No object/semantic masks.
+v1:
+  resource:
+    reference_min_frames: 10
+    reference_min_surfel_exposures: 6
+    reference_min_duration_s: 2.0
+    bounded_reference_search: true
+    # Recent history: up to 50 scans (more only to span 2 s at high rates), one build.
+    # No eligible history: try once min frames/span are available, retry per 10 new scans.
+    max_raw_buffer_points: 5000000
+  calibration:
+    # V2 real profile sigma_p=6 mm is a starting prior, not this bag's calibration.
+    independent_point_sigma_m: 0.006
+    reference_epoch_common_bias_sigma_m: 0.005
+    # Preserve the previous 9 mm ownership/stability spatial scale (sigma * point noise).
+    reference_stability_sigma: 1.5
+    # Keep the actual task scales: do not disguise false estimates by raising these.
+    task_displacement_scale_m: 0.005
+    task_interface_jump_scale_m: 0.005
+    task_velocity_scale_mps: 0.002
+    task_velocity_required_duration_s: 1.0

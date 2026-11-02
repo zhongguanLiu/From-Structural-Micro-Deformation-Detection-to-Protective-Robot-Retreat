@@ -1,0 +1,92 @@
+<launch>
+  <arg name="method" default="m_detector" />
+  <arg name="gui" default="false" />
+  <arg name="rviz" default="false" />
+  <arg name="output_directory" />
+  <arg name="linear_speed_mm_s" default="1.0" />
+  <arg name="start_delay" default="10.0" />
+  <arg name="duration" default="40.0" />
+  <arg name="end_hold" default="10.0" />
+  <arg name="motion_config"
+       default="$(find livox_laser_simulation)/config/icra2027_stationary_full_process_motion.yaml" />
+  <arg name="world"
+       default="$(find livox_laser_simulation)/worlds/ICRA2027.world" />
+
+  <include file="$(find livox_laser_simulation)/launch/icra2027_simulation.launch">
+    <arg name="world" value="$(arg world)" />
+    <arg name="motion_config" value="$(arg motion_config)" />
+    <arg name="gui" value="$(arg gui)" />
+    <arg name="rviz" value="false" />
+    <arg name="record_truth" value="false" />
+    <arg name="enable_rear_lidar" value="false" />
+    <arg name="enable_planar_move" value="false" />
+    <arg name="lidar_update_rate_hz" value="10.0" />
+    <arg name="lidar_min_range_m" value="0.5" />
+    <arg name="lidar_max_range_m" value="20.0" />
+    <arg name="primary_lidar_downsample" value="1" />
+    <arg name="linear_speed_mm_s" value="$(arg linear_speed_mm_s)" />
+    <arg name="angular_speed_rad_s" value="0.0015" />
+    <arg name="start_delay" value="$(arg start_delay)" />
+    <arg name="duration" value="$(arg duration)" />
+    <arg name="end_hold" value="$(arg end_hold)" />
+    <arg name="robot_x" value="-3.7902" />
+    <arg name="robot_y" value="12.1308" />
+    <arg name="robot_yaw" value="2.0688" />
+  </include>
+
+  <include file="$(find fast_lio)/launch/mapping_mid360.launch">
+    <arg name="rviz" value="false" />
+    <arg name="runtime_pos_log_enable" value="false" />
+    <arg name="runtime_performance_log_enable" value="false" />
+    <arg name="point_filter_num" value="1" />
+    <arg name="filter_size_surf" value="0.30" />
+    <arg name="filter_size_map" value="0.30" />
+    <arg name="cloud_output_point_stride" value="1" />
+  </include>
+
+  <group if="$(eval arg('method') == 'm_detector')">
+    <include file="$(find m_detector)/launch/fastlio_mid360.launch" />
+  </group>
+  <group if="$(eval arg('method') == 'spatiotemporal_normals')">
+    <include file="$(find dynamic_detector)/launch/fastlio_mid360.launch" />
+  </group>
+  <group if="$(eval arg('method') == 'dynablox')">
+    <include file="$(find dynablox_ros)/launch/fastlio_mid360.launch">
+      <arg name="config"
+           value="$(find compare_methods_benchmark)/config/dynablox_mid360.yaml" />
+    </include>
+  </group>
+  <group if="$(eval arg('method') == 'm3c2')">
+    <include file="$(find m3c2_baseline)/launch/fastlio_mid360.launch">
+      <arg name="output_directory" value="$(arg output_directory)" />
+    </include>
+  </group>
+
+  <node pkg="compare_methods_benchmark" type="benchmark_recorder.py"
+        name="compare_methods_benchmark_recorder" output="screen"
+        required="true">
+    <param name="method" value="$(arg method)" />
+    <param name="configured_speed_mm_s" value="$(arg linear_speed_mm_s)" />
+    <param name="output_directory" value="$(arg output_directory)" />
+    <param name="input_topic" value="/cloud_registered" />
+    <param name="truth_topic" value="/icra2027_motion/truth" />
+    <param name="odometry_topic" value="/Odometry" />
+    <param name="world_file" value="$(arg world)" />
+    <param name="motion_config_file" value="$(arg motion_config)" />
+    <!-- Keep every registered input frame: exact per-frame target visibility
+         is needed as the denominator for detection metrics.  Only aggregate
+         counts and bounds are stored, never the point cloud itself. -->
+    <param name="input_metadata_stride" value="1" />
+    <param name="motion_start_after_input_frames" value="10" />
+    <param name="aabb_margin_m" value="0.10" />
+    <!-- Evaluation-only rigid transform.  The detector sees neither this
+         transform nor any model identity/AABB.  body is 0.2801 m forward and
+         0.616928878 m above the saved robot origin. -->
+    <rosparam param="camera_init_origin_gazebo_xyzyaw">
+      [-3.9239961073, 12.3768784665, 2.122826878, 2.0688]
+    </rosparam>
+  </node>
+
+  <node if="$(arg rviz)" pkg="rviz" type="rviz"
+        name="compare_methods_rviz" output="log" />
+</launch>

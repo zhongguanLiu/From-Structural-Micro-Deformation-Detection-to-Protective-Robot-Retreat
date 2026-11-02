@@ -1,0 +1,13 @@
+std_msgs/Header header
+string source_snapshot_id
+uint32 reference_epoch
+uint64 source_accepted_frame_index
+time valid_until
+time prediction_valid_until
+string activation_policy
+string model_revision
+uint8 validity
+bool complete_snapshot
+bool input_contract_valid
+string status_detail
+deform_evolution_map/GduEvolution[] gdus

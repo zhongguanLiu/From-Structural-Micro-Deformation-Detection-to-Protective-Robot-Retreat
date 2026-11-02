@@ -1,0 +1,9 @@
+deform_monitor_v3/V1StableId128 cause_id
+deform_monitor_v3/V1StableId128 source_evidence_id
+uint8 semantics
+float64 probability_lower
+float64 probability_mean
+float64 probability_upper
+bool probability_mean_identified
+bool committed_to_posterior
+bool moved_available

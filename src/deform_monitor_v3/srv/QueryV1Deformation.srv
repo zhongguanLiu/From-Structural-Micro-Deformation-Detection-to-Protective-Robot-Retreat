@@ -1,0 +1,18 @@
+deform_monitor_v3/V1StableId128 snapshot_token
+deform_monitor_v3/V1StableId128 gdu_id
+geometry_msgs/Point point_on_reference
+int32 side_id
+time query_time
+---
+geometry_msgs/Vector3 displacement_mean
+geometry_msgs/Vector3 velocity_mean
+deform_monitor_v3/V1DenseMatrix64 displacement_covariance
+deform_monitor_v3/V1DenseMatrix64 velocity_covariance
+deform_monitor_v3/V1DenseMatrix64 observable_projector
+bool minimum_detectable_effect_defined
+float64 minimum_detectable_effect_m
+uint8 support_validity
+float64 interpolation_error_upper_m
+float64 other_mass
+deform_monitor_v3/V1DeformationComponentQuery[] components
+uint16[] reason_codes

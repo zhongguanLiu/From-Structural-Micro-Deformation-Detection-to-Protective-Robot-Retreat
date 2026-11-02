@@ -1,0 +1,68 @@
+v1:
+  calibration:
+    validated: false
+    version: UNSET
+    data_digest: UNSET
+    independent_point_sigma_m: 0.003
+    unobservable_residual_sigma_m: 0.10
+    contamination_probability: 0.05
+    student_t_dof: 5.0
+    student_t_scale: 3.0
+    pose_ou_tau_s: 0.5
+    pose_cross_covariance_bound_m2: 1.0e-6
+    ctmc_rates: [0.01, 0.002, 0.10, 0.02, 0.05]
+    active_acceleration_psd: 1.0e-5
+    changed_random_walk_psd: 1.0e-7
+    active_birth_velocity_variance: 1.0e-4
+    active_birth_displacement_variance: 1.0e-6
+    changed_birth_displacement_variance: 1.0e-4
+    # Metres; bounded continuous-state endpoint-reset error from halving
+    # ctmc_max_substep_s. Added as a geometric envelope, never as variance.
+    ctmc_halving_error_upper_m: 0.02
+    reference_stability_sigma: 3.0
+    reference_epoch_common_bias_sigma_m: 0.003
+    geometry_min_eigengap_ratio: 0.05
+    # Decimal form is intentional: rosparam's YAML 1.1 loader can classify
+    # an exponent without an explicit sign as a string rather than a double.
+    pose_control_max_condition_number: 100000000.0
+    pose_control_huber_scale_m: 0.02
+    reference_confounding_min_information_ratio: 0.10
+    reference_link_logit_bias: 4.0
+    reference_link_distance_weight: -4.0
+    reference_link_projector_weight: -2.0
+    link_probability_on: 0.80       
+    cut_probability_on: 0.10
+    interface_initial_link_probability: [0.89, 0.01, 0.10]
+    interface_coherence_transition_row_major: [0.97, 0.01, 0.02, 0.03, 0.94, 0.03, 0.20, 0.10, 0.70]
+    interface_coherent_rho: 0.20
+    interface_relative_rho: 1.0
+    interface_coherent_process_variance: 1.0e-7
+    interface_relative_process_variance: 1.0e-5
+    interface_unresolved_process_variance: 1.0e-3
+    geometry_softmax_weights_row_major: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    geometry_softmax_bias: [0.0, 0.0, 0.0, -2.0]  
+    association_weights: [-3.0, 1.0, -1.0, -0.2, 1.0, 1.0, 1.0]
+    association_candidate_bias: 0.0
+    association_missing_bias: -1.0
+    association_other_bias: -2.0
+    association_entropy_max: 1.2
+    visibility_min_range_m: 0.30
+    visibility_max_range_m: 40.0
+    occupancy_interval_alpha: 0.05
+    reference_beta_tempering: 0.5
+    reference_free_threshold: 0.15
+    reference_occupied_threshold: 0.65
+    task_displacement_scale_m: 0.005
+    task_velocity_scale_mps: 0.002
+    task_velocity_required_duration_s: 0.5
+    task_interface_jump_scale_m: 0.005
+    task_interface_metric_row_major: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    detection_probability_on: 0.99
+    clearing_probability_on: 0.01
+    event_false_alarm_probability: 0.01
+    target_power: 0.90
+    mde_bootstrap_inflation: 1.0
+    detection_min_effective_spatial_support: 2.0
+    detection_min_effective_temporal_support: 1.2
+    qmc_error_upper: 0.02
+    prediction_model_error_m: 0.01

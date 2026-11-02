@@ -1,0 +1,31 @@
+#ifndef DEFORM_MONITOR_V3_STRUCTURE_UNIT_BUILDER_HPP
+#define DEFORM_MONITOR_V3_STRUCTURE_UNIT_BUILDER_HPP
+#include "deform_monitor_v3/data_types.hpp"
+#include <vector>
+
+namespace deform_monitor_v3 {
+
+class StructureUnitBuilder {
+public:
+  explicit StructureUnitBuilder(const StructureUnitParams& params);
+
+  
+  StructureUnitVector Build(const AnchorReferenceVector& anchors);
+
+private:
+  StructureUnitParams params_;
+
+  
+  using VoxelKey = std::tuple<int, int, int>;
+  struct VoxelKeyHash {
+    size_t operator()(const VoxelKey& k) const;
+  };
+
+  bool ShouldConnect(const AnchorReference& a,
+                     const AnchorReference& b,
+                     RegionEdgeType& out_type) const;
+};
+
+}  // namespace deform_monitor_v3
+
+#endif  // DEFORM_MONITOR_V3_STRUCTURE_UNIT_BUILDER_HPP

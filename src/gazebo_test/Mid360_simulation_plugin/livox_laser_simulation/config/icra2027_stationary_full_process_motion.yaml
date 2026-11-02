@@ -1,0 +1,47 @@
+# Stationary observation benchmark: the robot remains fixed at the monitoring
+# pose while all six controlled bodies move together after a 10 s baseline.
+start_delay: 10.0
+motion_mode: simultaneous
+duration: 40.0
+end_hold: 10.0
+truth_rate_hz: 10.0
+linear_speed_mm_s: 1.0
+angular_speed_rad_s: 0.0015
+
+models:
+  - id: 1
+    model_name: m01
+    command_frame: world
+    linear_direction: [-0.9000116564182479, -0.4274638382988337, 0.0851685696610569]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []
+  - id: 2
+    model_name: m02
+    command_frame: world
+    linear_direction: [0.9008828563623635, -0.4052922873611565, 0.1553970428224124]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []
+  - id: 3
+    model_name: m03
+    command_frame: world
+    linear_direction: [0.0966034850335850, -0.9902357233980940, 0.1005036257336987]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []
+  - id: 4
+    model_name: m04
+    command_frame: world
+    linear_direction: [0.6989996111759129, -0.7151220480281130, 0.0]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []
+  - id: 5
+    model_name: m05
+    command_frame: world
+    linear_direction: [-0.7603891569279329, -0.6493907397540762, -0.0099998574030501]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []
+  - id: 6
+    model_name: m06
+    command_frame: world
+    linear_direction: [-0.0730428778713612, -0.0822176285782220, -0.9939341022136442]
+    angular_axis: [0.0, 0.0, 0.0]
+    surface_points: []

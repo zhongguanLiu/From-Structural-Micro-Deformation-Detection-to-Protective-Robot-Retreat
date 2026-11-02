@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>a2_description</name>
+  <version>1.0.0</version>
+  <description>Official Unitree A2 meshes and complete URDF, with a local Mid360 simulation wrapper.</description>
+  <maintainer email="zgliu@localhost.localdomain">Research_works5</maintainer>
+  <license>BSD</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <exec_depend>xacro</exec_depend>
+  <export><architecture_independent/></export>
+</package>

@@ -1,0 +1,53 @@
+global_costmap:
+  global_frame: camera_init
+  robot_base_frame: navigation_base
+  transform_tolerance: 0.5
+  update_frequency: 5.0
+  publish_frequency: 2.0
+  always_send_full_costmap: true
+  static_map: true
+  rolling_window: false
+  track_unknown_space: true
+  footprint: [[0.36, 0.30], [0.36, -0.30], [-0.36, -0.30], [-0.36, 0.30]]
+  # Keep the original physical footprint margin identical in both planners.
+  # Extra stand-off is a graded inflation cost, not an enlarged hard footprint.
+  footprint_padding: 0.01
+  plugins:
+    - {name: static_layer, type: "costmap_2d::StaticLayer"}
+    - {name: obstacle_layer, type: "costmap_2d::ObstacleLayer"}
+    - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
+  static_layer:
+    map_topic: /mission/navigation_map
+    subscribe_to_updates: false
+    first_map_only: false
+    track_unknown_space: true
+    unknown_cost_value: -1
+    lethal_cost_threshold: 100
+    # Preserve 1..99 as finite costs (99 -> 251); only SLAM 100 -> lethal 254.
+    trinary_costmap: false
+  # Retain the deformation decision while SLAM and live obstacles both update.
+  # Navfn and DWA must use the same current LiDAR geometry; otherwise Navfn
+  # repeatedly sends DWA through obstacles absent from the frozen SLAM layer.
+  obstacle_layer:
+    enabled: true
+    observation_sources: registered_cloud
+    registered_cloud:
+      data_type: PointCloud2
+      topic: /navigation/cloud_registered_body
+      sensor_frame: body
+      marking: true
+      clearing: true
+      min_obstacle_height: -0.25
+      max_obstacle_height: 1.20
+      obstacle_range: 7.0
+      raytrace_range: 8.0
+      observation_persistence: 0.0
+      expected_update_rate: 0.0
+      inf_is_valid: false
+    track_unknown_space: true
+    combination_method: 1
+  inflation_layer:
+    # Wider graded stand-off for cornering with delayed measured odometry;
+    # the physical footprint and hard collision threshold remain unchanged.
+    inflation_radius: 1.00
+    cost_scaling_factor: 2.0

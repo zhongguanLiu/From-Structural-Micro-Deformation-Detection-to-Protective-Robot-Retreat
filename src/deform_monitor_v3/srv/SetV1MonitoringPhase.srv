@@ -1,0 +1,14 @@
+string session_id
+uint8 target_phase
+geometry_msgs/Point roi_min
+geometry_msgs/Point roi_max
+time effective_stamp
+uint8 trigger_source
+time selection_support_cutoff
+deform_monitor_v3/V1StableId128 expected_previous_snapshot
+---
+bool accepted
+uint8 phase
+uint32 reference_epoch
+deform_monitor_v3/V1StableId128 reference_snapshot_id
+uint16[] reason_codes

@@ -1,0 +1,80 @@
+shutdown_costmaps: false
+controller_frequency: 15.0
+planner_frequency: 2.0
+planner_patience: 8.0
+controller_patience: 12.0
+oscillation_timeout: 12.0
+oscillation_distance: 0.20
+base_global_planner: navfn/NavfnROS
+base_local_planner: dwa_local_planner/DWAPlannerROS
+# Read-only native route queries used during bounded mission recovery.
+make_plan_clear_costmap: false
+make_plan_add_unreachable_goal: false
+# Built-in recovery plugins publish /cmd_vel outside DWA's dynamically
+# verified envelope. The mission retries a failed goal at most twice, aligning
+# to a fresh native plan with live swept-footprint checks. Unverified recovery
+# is disabled instead of silently commanding the default 1 rad/s turn.
+recovery_behavior_enabled: false
+clearing_rotation_allowed: false
+
+NavfnROS:
+  allow_unknown: false
+  default_tolerance: 0.35
+
+DWAPlannerROS:
+  # FAST-LIO's /Odometry pose is valid but its Twist is left at zero.  DWA's
+  # dynamic window would therefore be clamped to min_vel_x on every cycle.
+  # The adapter differentiates the same FAST-LIO pose and supplies body-frame
+  # linear/angular velocity; no Gazebo ground truth enters navigation.
+  odom_topic: /navigation/odometry
+  global_frame_id: camera_init
+  robot_base_frame: navigation_base
+  max_vel_trans: 1.25
+  # Start/turn speeds must be reachable in one 1/15 s dynamic window:
+  # acc_lim_x/15=0.133 and acc_lim_theta/15=0.100.
+  min_vel_trans: 0.05
+  max_vel_x: 1.25
+  # Both outbound and deformation-aware return reuse this forward move_base
+  # profile on their respective SLAM/fused maps.
+  # Permit a bounded backing manoeuvre when a rectangular base cannot turn
+  # in place beside rubble. These samples use the same collision checks.
+  min_vel_x: -0.30
+  min_vel_y: 0.0
+  max_vel_y: 0.0
+  max_vel_theta: 0.90
+  min_vel_theta: 0.05
+  acc_lim_x: 2.00
+  # Permits noisy measured lateral Twist to reach its zero command bound;
+  # min/max_vel_y=0 still forbids every sideways command.
+  acc_lim_y: 2.0
+  acc_lim_theta: 1.50
+  holonomic_robot: false
+  yaw_goal_tolerance: 0.5235987756
+  # Internal tolerance for the reachable grid-cell goal.  The mission-level
+  # acceptance remains the requested 0.80 m around (17.84, 6.70); keeping these
+  # tolerances separate prevents them from adding to nearly one metre.
+  xy_goal_tolerance: 0.15
+  latch_xy_goal_tolerance: true
+  # Both phases: look through bends, not only at their entry cell. A 1.2 s
+  # window exhibited repeated loops/local stalls in the recorded scene.
+  # Keep this above the braking horizon (0.975 s at maximum speed).
+  sim_time: 2.5
+  # The mission must not silently shorten this horizon on return.
+  sim_granularity: 0.05
+  angular_sim_granularity: 0.05
+  vx_samples: 14
+  vy_samples: 1
+  vtheta_samples: 28
+  path_distance_bias: 40.0
+  goal_distance_bias: 24.0
+  occdist_scale: 0.05
+  forward_point_distance: 0.25
+  # Penalize unproductive spinning while keeping collision-checked turns and
+  # reverse samples available. The ROS default is zero (no spinning penalty).
+  # Large values suppress necessary cornering as well as spinning.
+  twirling_scale: 0.1
+  stop_time_buffer: 0.35
+  scaling_speed: 0.80
+  max_scaling_factor: 0.30
+  publish_traj_pc: false
+  publish_cost_grid_pc: false

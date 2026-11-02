@@ -1,0 +1,41 @@
+# Local build and verification products
+.verification/
+/build/
+/devel/
+/install/
+/logs/
+/src/compare_methods/build/
+/src/compare_methods/devel/
+/src/compare_methods/install/
+/src/compare_methods/logs/
+**/__pycache__/
+**/.pytest_cache/
+*.py[cod]
+*.o
+*.so
+*.a
+*.log
+# Recorded experiments and generated figures
+/experiment_output/
+*.bag
+*.db3
+*.pcd
+*.npz
+*.npy
+*.mp4
+*.avi
+/src/FAST_LIO/Log/*
+!/src/FAST_LIO/Log/.gitkeep
+/src/FAST_LIO/PCD/*
+!/src/FAST_LIO/PCD/.gitkeep
+/src/IEEE_ICRA2027/*_analysis/
+/src/IEEE_ICRA2027/*_audit.json
+/src/IEEE_ICRA2027/figures/
+/src/IEEE_ICRA2027/.local_fonts/
+/src/figure_tools/figures/
+/src/figure_tools/tables/
+/src/IEEE_ICRA2027_SUBMIT/
+# Editor and local machine settings
+.vscode/
+.idea/
+.DS_Store

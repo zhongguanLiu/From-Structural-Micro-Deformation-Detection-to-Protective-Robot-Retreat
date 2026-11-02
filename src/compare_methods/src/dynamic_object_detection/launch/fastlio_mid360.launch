@@ -1,0 +1,15 @@
+<launch>
+  <arg name="config" default="$(find dynamic_detector)/cfg/parameters.yaml" />
+  <arg name="input_topic" default="/cloud_registered" />
+  <arg name="dynamic_topic"
+       default="/compare/spatiotemporal_normals/dynamic_points" />
+  <arg name="runtime_topic"
+       default="/compare/spatiotemporal_normals/runtime" />
+
+  <rosparam command="load" file="$(arg config)" />
+  <param name="input_topic" value="$(arg input_topic)" />
+  <param name="dynamic_output_topic" value="$(arg dynamic_topic)" />
+  <param name="runtime_output_topic" value="$(arg runtime_topic)" />
+  <node pkg="dynamic_detector" type="dynamic_detector"
+        name="spatiotemporal_normals_compare" output="log" required="true" />
+</launch>

@@ -1,0 +1,8 @@
+<launch>
+  <arg name="output_directory" />
+  <node pkg="m3c2_baseline" type="m3c2_node" name="m3c2_baseline" output="log" required="true">
+    <rosparam command="load" file="$(find m3c2_baseline)/config/mid360.yaml" />
+    <param name="input_topic" value="/cloud_registered" />
+    <param name="output_directory" value="$(arg output_directory)/m3c2" />
+  </node>
+</launch>

@@ -1,0 +1,13 @@
+int32 id
+uint8 event_semantics
+geometry_msgs/Point center
+geometry_msgs/Point bbox_min
+geometry_msgs/Point bbox_max
+geometry_msgs/Vector3 principal_direction
+float32 peak_deformation_probability
+float32 peak_novel_probability
+float32 peak_decision_cost
+float32 mean_decision_cost
+float32 direction_confidence
+float32 unknown_fraction
+uint32 voxel_count

@@ -1,0 +1,5 @@
+deform_monitor_v3/V1StableId128 snapshot_token
+string robot_geometry_revision
+deform_monitor_v3/V1TimedRobotPose state
+---
+deform_monitor_v3/V1RiskAssessment assessment

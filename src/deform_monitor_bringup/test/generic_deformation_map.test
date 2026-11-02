@@ -1,0 +1,8 @@
+<launch>
+  <include file="$(find deform_evolution_map)/launch/evolution.launch" />
+  <include file="$(find deform_avoidance_map)/launch/avoidance.launch" />
+  <test test-name="generic_deformation_map"
+        pkg="deform_monitor_bringup"
+        type="test_generic_deformation_map.py"
+        time-limit="40" />
+</launch>

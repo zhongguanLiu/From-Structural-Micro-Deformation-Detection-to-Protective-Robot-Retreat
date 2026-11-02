@@ -1,0 +1,31 @@
+#ifndef DEFORM_MONITOR_V3_STRUCTURE_VISUALIZATION_PUBLISHER_HPP
+#define DEFORM_MONITOR_V3_STRUCTURE_VISUALIZATION_PUBLISHER_HPP
+
+#include <visualization_msgs/MarkerArray.h>
+
+#include "deform_monitor_v3/StructureMotions.h"
+#include "deform_monitor_v3/data_types.hpp"
+
+namespace deform_monitor_v3 {
+
+class StructureVisualizationPublisher {
+public:
+  void SetParams(const StructureCorrespondenceParams& params);
+
+  deform_monitor_v3::StructureMotions BuildStructureMotionsMsg(
+      const StructureMotionVector& motions,
+      const ros::Time& stamp,
+      const std::string& frame_id) const;
+
+  visualization_msgs::MarkerArray BuildMarkers(
+      const StructureMotionVector& motions,
+      const ros::Time& stamp,
+      const std::string& frame_id) const;
+
+private:
+  StructureCorrespondenceParams params_;
+};
+
+}  // namespace deform_monitor_v3
+
+#endif  // DEFORM_MONITOR_V3_STRUCTURE_VISUALIZATION_PUBLISHER_HPP
